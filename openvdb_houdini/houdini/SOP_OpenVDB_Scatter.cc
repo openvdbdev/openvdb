@@ -38,6 +38,8 @@
 #include <houdini_utils/ParmFactory.h>
 #include <openvdb_houdini/Utils.h>
 #include <openvdb_houdini/SOP_NodeVDB.h>
+#include <openvdb/points/PointScatter.h>
+#include <openvdb/points/PointGroup.h>
 #include <openvdb/tools/PointScatter.h>
 #include <openvdb/tools/LevelSetUtil.h>
 #include <boost/algorithm/string/join.hpp>
@@ -88,6 +90,16 @@ newSopOperator(OP_OperatorTable* table)
     parms.add(hutil::ParmFactory(PRM_TOGGLE, "keep", "Keep Input VDBs")
         .setDefault(PRMzeroDefaults)
         .setTooltip("If enabled, the output will contain the input VDB grids."));
+
+    // Enable VDB Points
+    parms.add(hutil::ParmFactory(PRM_TOGGLE, "vdbpoints", "Scatter VDB Points")
+        .setDefault(PRMzeroDefaults)
+        .setTooltip("Generate VDB Points instead of Houdini Points."));
+
+    // VDB points grid name
+    parms.add(hutil::ParmFactory(PRM_STRING, "name", "VDB Name")
+        .setDefault("points")
+        .setTooltip("The name of the VDB Points primitive to be created"));
 
     // Group scattered points
     parms.add(hutil::ParmFactory(PRM_TOGGLE, "dogroup", "")
@@ -143,13 +155,15 @@ newSopOperator(OP_OperatorTable* table)
     // Point density
     parms.add(hutil::ParmFactory(PRM_FLT_J, "density", "Density")
         .setDefault(PRMoneDefaults)
-        .setRange(PRM_RANGE_RESTRICTED, 0, PRM_RANGE_UI, 10)
+        .setRange(PRM_RANGE_RESTRICTED, 0, PRM_RANGE_UI, 1000)
         .setTooltip("The number of points per unit volume (when __Mode__ is Point Density)"));
 
     // Toggle to use voxel value as local point density multiplier
     parms.add(hutil::ParmFactory(PRM_TOGGLE, "multiply", "Scale Density by Voxel Values")
         .setDefault(PRMzeroDefaults)
-        .setTooltip("If enabled, use voxel values as local multipliers for the point density."));
+        .setTooltip(
+            "If enabled, use voxel values as local multipliers for the point density."
+            " Has no impact if interior scattering is enabled."));
 
     // Points per voxel
     parms.add(hutil::ParmFactory(PRM_FLT_J , "ppv", "Count")
@@ -163,6 +177,12 @@ newSopOperator(OP_OperatorTable* table)
         .setTooltip(
             "If enabled, scatter points in the interior region of a level set."
             " Otherwise, scatter points only in the narrow band."));
+
+    // an iso-surface offset for interior scattering
+    parms.add(hutil::ParmFactory(PRM_FLT_J, "offset", "Offset")
+        .setDefault(PRMzeroDefaults)
+        .setRange(PRM_RANGE_UI, -1.0f, PRM_RANGE_UI, 1.0f)
+        .setTooltip("The offset at which to interpret the iso surface."));
 
     parms.add(hutil::ParmFactory(PRM_SEPARATOR, "sep2", ""));
 
@@ -183,11 +203,13 @@ newSopOperator(OP_OperatorTable* table)
 #icon: COMMON/openvdb\n\
 #tags: vdb\n\
 \n\
-\"\"\"Scatter points on a VDB volume.\"\"\"\n\
+\"\"\"Scatter Houdini or VDB points on a VDB volume.\"\"\"\n\
 \n\
 @overview\n\
 \n\
-This node scatters points randomly on or inside a VDB volume.\n\
+This node scatters points randomly on or inside a VDB volume. It can produce a set\n\
+of Houdini points or a VDB Points grid for every provided VDB. Each VDB Points grid\n\
+created will copy the transform and topology of each source VDB.\n\
 The number of points generated can be specified either by fixed count\n\
 or by global or local point density.\n\
 \n\
@@ -222,12 +244,16 @@ bool
 SOP_OpenVDB_Scatter::updateParmsFlags()
 {
     bool changed = false;
+    const auto vdbpoints = evalInt("vdbpoints", /*idx=*/0, /*time=*/0);
     const auto pmode = evalInt("pointmode", /*idx=*/0, /*time=*/0);
+    const auto interior = evalInt("interior", /*idx=*/0, /*time=*/0);
 
     changed |= setVisibleState("count",    (0 == pmode));
     changed |= setVisibleState("density",  (1 == pmode));
     changed |= setVisibleState("multiply", (1 == pmode));
     changed |= setVisibleState("ppv",      (2 == pmode));
+    changed |= setVisibleState("name",     (1 == vdbpoints));
+    changed |= enableParm("offset", interior);
 
     const auto dogroup = evalInt("dogroup", 0, 0);
     changed |= enableParm("sgroup", 1 == dogroup);
@@ -273,32 +299,160 @@ protected:
 };
 
 
-// Method to extract the interior mask before scattering points.
-template<typename OpType>
-bool
-processLSInterior(UT_VDBType gridType, const openvdb::GridBase& gridRef, OpType& op)
+struct BaseScatter
 {
-    if (gridType == UT_VDB_FLOAT) {
-        const openvdb::FloatGrid* grid = static_cast<const openvdb::FloatGrid*>(&gridRef);
-        if (grid == nullptr) return false;
+    using PositionArray =
+        openvdb::points::TypedAttributeArray<openvdb::Vec3f, openvdb::points::NullCodec>;
 
-        typename openvdb::Grid<typename openvdb::FloatTree::template ValueConverter<bool>::Type>::Ptr maskGrid;
-        maskGrid = openvdb::tools::sdfInteriorMask(*grid);
-        op(*maskGrid);
+    BaseScatter(const unsigned int seed,
+                const float spread,
+                hvdb::Interrupter* interrupter)
+        : mPoints()
+        , mSeed(seed)
+        , mSpread(spread)
+        , mInterrupter(interrupter) {}
 
-        return true;
-
-    } else if (gridType == UT_VDB_DOUBLE) {
-        const openvdb::DoubleGrid* grid = static_cast<const openvdb::DoubleGrid*>(&gridRef);
-        if (grid == nullptr) return false;
-
-        typename openvdb::Grid<typename openvdb::DoubleTree::template ValueConverter<bool>::Type>::Ptr maskGrid;
-        maskGrid = openvdb::tools::sdfInteriorMask(*grid);
-        op(*maskGrid);
-
-        return true;
+    /// @brief Print information about the scattered points
+    /// @parm name  A name to insert into the printed info
+    /// @parm os    The output stream
+    virtual void print(const std::string &name, std::ostream& os = std::cout) const
+    {
+        if (!mPoints) return;
+        const openvdb::Index64 points = openvdb::points::pointCount(mPoints->tree());
+        const openvdb::Index64 voxels = mPoints->activeVoxelCount();
+        os << points << " points into " << voxels << " active voxels in \""
+           << name << "\" corresponding to " << (double(points) / double(voxels))
+           << " points per voxel." << std::endl;
     }
-    return false;
+
+    inline openvdb::points::PointDataGrid::Ptr points()
+    {
+        assert(mPoints);
+        return mPoints;
+    }
+
+protected:
+    openvdb::points::PointDataGrid::Ptr mPoints;
+    const unsigned int mSeed;
+    const float mSpread;
+    hvdb::Interrupter* mInterrupter;
+}; // BaseScatter
+
+
+struct VDBUniformScatter : public BaseScatter
+{
+    VDBUniformScatter(const openvdb::Index64 count,
+                      const unsigned int seed,
+                      const float spread,
+                      hvdb::Interrupter* interrupter)
+        : mCount(count)
+        , BaseScatter(seed, spread, interrupter) {}
+
+    template <typename GridT>
+    inline void operator()(const GridT& grid)
+    {
+        using namespace openvdb::points;
+        using PointDataGridT = openvdb::Grid<typename TreeConverter<typename GridT::TreeType>::Type>;
+        mPoints = uniformPointScatter<GridT, std::mt19937, PositionArray, PointDataGridT,
+                hvdb::Interrupter>(grid, mCount, mSeed, mSpread, mInterrupter);
+    }
+
+    void print(const std::string &name, std::ostream& os = std::cout) const
+    {
+        os << "Uniformly scattered ";
+        BaseScatter::print(name, os);
+    }
+    const openvdb::Index64 mCount;
+}; // VDBUniformScatter
+
+
+struct VDBDenseUniformScatter : public BaseScatter
+{
+    VDBDenseUniformScatter(const float pointsPerVoxel,
+                           const unsigned int seed,
+                           const float spread,
+                           hvdb::Interrupter* interrupter)
+        : mPointsPerVoxel(pointsPerVoxel)
+        , BaseScatter(seed, spread, interrupter) {}
+
+    template <typename GridT>
+    inline void operator()(const GridT& grid)
+    {
+        using namespace openvdb::points;
+        using PointDataGridT = openvdb::Grid<typename TreeConverter<typename GridT::TreeType>::Type>;
+        mPoints = denseUniformPointScatter<GridT, std::mt19937, PositionArray, PointDataGridT,
+                hvdb::Interrupter>(grid, mPointsPerVoxel, mSeed, mSpread, mInterrupter);
+    }
+
+    void print(const std::string &name, std::ostream& os = std::cout) const
+    {
+        os << "Dense uniformly scattered ";
+        BaseScatter::print(name, os);
+    }
+    const float mPointsPerVoxel;
+}; // VDBDenseUniformScatter
+
+
+struct VDBNonUniformScatter : public BaseScatter
+{
+    VDBNonUniformScatter(const float pointsPerVoxel,
+                      const unsigned int seed,
+                      const float spread,
+                      hvdb::Interrupter* interrupter)
+        : mPointsPerVoxel(pointsPerVoxel)
+        , BaseScatter(seed, spread, interrupter) {}
+
+    template <typename GridT>
+    inline void operator()(const GridT& grid)
+    {
+        using namespace openvdb::points;
+        using PointDataGridT = openvdb::Grid<typename TreeConverter<typename GridT::TreeType>::Type>;
+        mPoints = nonUniformPointScatter<GridT, std::mt19937, PositionArray, PointDataGridT,
+                hvdb::Interrupter>(grid, mPointsPerVoxel, mSeed, mSpread, mInterrupter);
+    }
+
+    void print(const std::string &name, std::ostream& os = std::cout) const
+    {
+        os << "Non-uniformly scattered ";
+        BaseScatter::print(name, os);
+    }
+    const float mPointsPerVoxel;
+}; // VDBNonUniformScatter
+
+
+template<typename OpType>
+inline bool
+process(const UT_VDBType type, const openvdb::GridBase& grid, OpType& op, const std::string* name)
+{
+    bool success(false);
+    success = UTvdbProcessTypedGridTopology(type, grid, op);
+    if (!success) {
+#if UT_MAJOR_VERSION_INT >= 16
+        success = UTvdbProcessTypedGridPoint(type, grid, op);
+#endif
+    }
+    if (name) op.print(*name);
+    return success;
+}
+
+
+// Method to extract the interior mask before scattering points.
+openvdb::GridBase::ConstPtr
+extractInteriorMask(const openvdb::GridBase::ConstPtr grid, const float offset)
+{
+    if (grid->isType<openvdb::FloatGrid>()) {
+        using MaskT = openvdb::Grid<openvdb::FloatTree::ValueConverter<bool>::Type>;
+        const openvdb::FloatGrid& typedGrid = static_cast<const openvdb::FloatGrid&>(*grid);
+        MaskT::Ptr mask = openvdb::tools::sdfInteriorMask(typedGrid, offset);
+        return mask;
+
+    } else if (grid->isType<openvdb::DoubleGrid>()) {
+        using MaskT = openvdb::Grid<openvdb::DoubleTree::ValueConverter<bool>::Type>;
+        const openvdb::DoubleGrid& typedGrid = static_cast<const openvdb::DoubleGrid&>(*grid);
+        MaskT::Ptr mask = openvdb::tools::sdfInteriorMask(typedGrid, offset);
+        return mask;
+    }
+    return openvdb::GridBase::ConstPtr();
 }
 
 
@@ -312,27 +466,37 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
         hutil::ScopedInputLock lock(*this, context);
         const fpreal time = context.getTime();
 
-        const GU_Detail* vdbgeo = inputGeo(0);
+        const GU_Detail* vdbgeo;
+        if (1 == evalInt("keep", 0, time)) {
+            // This does a deep copy of native Houdini primitives
+            // but only a shallow copy of OpenVDB grids.
+            duplicateSourceStealable(0, context);
+            vdbgeo = gdp;
+        }
+        else {
+            vdbgeo = inputGeo(0);
+            gdp->clearAndDestroy();
+        }
 
-        gdp->clearAndDestroy();
-
-        const int seed = static_cast<int>(evalInt("seed", /*idx=*/0, time));
-        const double spread = evalFloat("spread", 0, time);
-        const bool verbose   = evalInt("verbose", /*idx=*/0, time) != 0;
+        const int seed = static_cast<int>(evalInt("seed", 0, time));
+        const double spread = static_cast<double>(evalFloat("spread", 0, time));
+        const bool verbose = evalInt("verbose", 0, time) != 0;
         const openvdb::Index64 pointCount = evalInt("count", 0, time);
-        const float density  = static_cast<float>(evalFloat("density", 0, time));
         const float ptsPerVox = static_cast<float>(evalFloat("ppv", 0, time));
-        const bool interior  = evalInt("interior", /*idx=*/0, time) != 0;
-
+        const bool interior = evalInt("interior", 0, time) != 0;
+        const float offset = static_cast<float>(evalFloat("offset", 0, time));
+        const float density = static_cast<float>(evalFloat("density", 0, time));
+        const bool multiplyDensity = evalInt("multiply", 0, time) != 0;
 
         // Get the group of grids to process.
-        UT_String groupStr;
-        evalString(groupStr, "group", 0, time);
+        UT_String tmp;
+        evalString(tmp, "group", 0, time);
         const GA_PrimitiveGroup* group
-            = this->matchGroup(const_cast<GU_Detail&>(*vdbgeo), groupStr.toStdString());
+            = this->matchGroup(const_cast<GU_Detail&>(*vdbgeo), tmp.toStdString());
 
+        evalString(tmp, "name", 0, time);
+        const std::string vdbName = tmp.toStdString();
         hvdb::Interrupter boss("OpenVDB Scatter");
-        PointAccessor points(gdp);
 
         // Choose a fast random generator with a long period. Drawback here for
         // mt11213b is that it requires 352*sizeof(uint32) bytes.
@@ -341,96 +505,100 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
         RandGen mtRand(seed);
 
         const auto pmode = evalInt("pointmode", 0, time);
+        const bool vdbPoints = evalInt("vdbpoints", 0, time) == 1;
 
         std::vector<std::string> emptyGrids;
+        std::vector<openvdb::points::PointDataGrid::Ptr> pointGrids;
+        PointAccessor pointAccessor(gdp);
 
         // Process each VDB primitive (with a non-null grid pointer)
         // that belongs to the selected group.
         for (hvdb::VdbPrimCIterator primIter(vdbgeo, group); primIter; ++primIter) {
 
             // Retrieve a read-only grid pointer.
-            hvdb::GridCRef grid = primIter->getGrid();
             UT_VDBType gridType = primIter->getStorageType();
-            const openvdb::GridClass gridClass = grid.getGridClass();
-            const bool isSignedDistance = (gridClass == openvdb::GRID_LEVEL_SET);
+            openvdb::GridBase::ConstPtr grid = primIter->getConstGridPtr();
             const std::string gridName = primIter.getPrimitiveName().toStdString();
 
-            if (grid.empty()) {
+            if (grid->empty()) {
                 emptyGrids.push_back(gridName);
                 continue;
             }
 
+            const std::string* const name = verbose ? &gridName : nullptr;
+            const openvdb::GridClass gridClass = grid->getGridClass();
+            const bool isSignedDistance = (gridClass == openvdb::GRID_LEVEL_SET);
+
+            if (interior && isSignedDistance) {
+                grid = extractInteriorMask(grid, offset);
+                gridType = UT_VDB_BOOL;
+                if (!grid) continue;
+            }
+
             if (pmode == 0) { // fixed point count
-
-                openvdb::tools::UniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
-                    scatter(points, pointCount, mtRand, spread, &boss);
-
-                if (interior && isSignedDistance) {
-                    processLSInterior(gridType, grid, scatter);
-                } else {
-                    if (!UTvdbProcessTypedGridScalar(gridType, grid, scatter)) {
-#if UT_MAJOR_VERSION_INT >= 16
-                        UTvdbProcessTypedGridPoint(gridType, grid, scatter);
-#endif
+                if (vdbPoints) { // vdb points
+                    VDBUniformScatter scatter(pointCount, seed, spread, &boss);
+                    if (process(gridType, *grid, scatter, name))  {
+                        pointGrids.push_back(scatter.points());
                     }
                 }
-
-                if (verbose) scatter.print(gridName);
+                else { // houdini points
+                    openvdb::tools::UniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
+                        scatter(pointAccessor, pointCount, mtRand, spread, &boss);
+                    process(gridType, *grid, scatter, name);
+                }
 
             } else if (pmode == 1) { // points per unit volume
-
-                if (evalInt("multiply", 0, time) != 0) { // local density
-                    openvdb::tools::NonUniformPointScatter<PointAccessor,RandGen,hvdb::Interrupter>
-                        scatter(points, density, mtRand, spread, &boss);
-
-
-                    if (interior && isSignedDistance) {
-                        processLSInterior(gridType, grid, scatter);
-                    } else {
-
-                        if (!UTvdbProcessTypedGridScalar(gridType, grid, scatter)) {
+                if (multiplyDensity && !isSignedDistance) { // local density
+                    if (vdbPoints) { // vdb points
+                        const openvdb::Vec3d dim = openvdb::Vec3f(grid->transform().voxelSize());
+                        VDBNonUniformScatter scatter(density * dim.product(), seed, spread, &boss);
+                        if (!UTvdbProcessTypedGridScalar(gridType, *grid, scatter)) {
                             throw std::runtime_error
                                 ("Only scalar grids support voxel scaling of density");
                         }
+                        pointGrids.push_back(scatter.points());
+                        if (verbose) scatter.print(gridName);
                     }
+                    else { // houdini points
+                        openvdb::tools::NonUniformPointScatter<PointAccessor,RandGen,hvdb::Interrupter>
+                            scatter(pointAccessor, density, mtRand, spread, &boss);
 
-                    if (verbose) scatter.print(gridName);
-
+                        if (!UTvdbProcessTypedGridScalar(gridType, *grid, scatter)) {
+                            throw std::runtime_error
+                                ("Only scalar grids support voxel scaling of density");
+                        }
+                        if (verbose) scatter.print(gridName);
+                    }
                 } else { // global density
-                    openvdb::tools::UniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
-                        scatter(points, density, mtRand, spread, &boss);
-
-                    if (interior && isSignedDistance) {
-                        processLSInterior(gridType, grid, scatter);
-                    } else {
-                        if (!UTvdbProcessTypedGridTopology(gridType, grid, scatter)) {
-#if UT_MAJOR_VERSION_INT >= 16
-                            UTvdbProcessTypedGridPoint(gridType, grid, scatter);
-#endif
+                    if (vdbPoints) { // vdb points
+                        const openvdb::Vec3f dim = openvdb::Vec3f(grid->transform().voxelSize());
+                        const openvdb::Index64 totalPointCount =
+                            openvdb::Index64(density * dim.product()) * grid->activeVoxelCount();
+                        VDBUniformScatter scatter(totalPointCount, seed, spread, &boss);
+                        if (process(gridType, *grid, scatter, name))  {
+                            pointGrids.push_back(scatter.points());
                         }
                     }
-
-                    if (verbose) scatter.print(gridName);
-                }
-
-            } else if (pmode == 2) { // points per voxel
-
-                openvdb::tools::DenseUniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
-                    scatter(points, ptsPerVox, mtRand, spread, &boss);
-
-                if (interior && isSignedDistance) {
-                    processLSInterior(gridType, grid, scatter);
-                } else {
-                    if (!UTvdbProcessTypedGridTopology(gridType, grid, scatter)) {
-#if UT_MAJOR_VERSION_INT >= 16
-                        UTvdbProcessTypedGridPoint(gridType, grid, scatter);
-#endif
+                    else { // houdini points
+                        openvdb::tools::UniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
+                            scatter(pointAccessor, density, mtRand, spread, &boss);
+                        process(gridType, *grid, scatter, name);
                     }
                 }
-
-                if (verbose) scatter.print(gridName);
+            } else if (pmode == 2) { // points per voxel
+                if (vdbPoints) { // vdb points
+                    VDBDenseUniformScatter scatter(ptsPerVox, seed, spread, &boss);
+                    if (process(gridType, *grid, scatter, name))  {
+                        pointGrids.push_back(scatter.points());
+                    }
+                }
+                else { // houdini points
+                    openvdb::tools::DenseUniformPointScatter<PointAccessor, RandGen, hvdb::Interrupter>
+                        scatter(pointAccessor, ptsPerVox, mtRand, spread, &boss);
+                    process(gridType, *grid, scatter, name);
+                }
             }
-
         } // for each grid
 
         if (!emptyGrids.empty()) {
@@ -447,13 +615,17 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
 
             // add ALL the points to this group
             ptgroup->addRange(gdp->getPointRange());
+
+            const std::string groupName(scatterStr.toStdString());
+            for (auto& pointGrid : pointGrids) {
+                openvdb::points::appendGroup(pointGrid->tree(), groupName);
+                openvdb::points::setGroup(pointGrid->tree(), groupName);
+            }
         }
 
-        // add the VDBs to the output if requested
-        if (1 == evalInt("keep", 0, time)) {
-            gdp->mergePrimitives(*vdbgeo, vdbgeo->getPrimitiveRange());
+        for (auto& pointGrid : pointGrids) {
+            hvdb::createVdbPrimitive(*gdp, pointGrid, vdbName.c_str());
         }
-
     }
     catch (std::exception& e) {
         addError(SOP_MESSAGE, e.what());
