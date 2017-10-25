@@ -38,8 +38,10 @@
 #include <houdini_utils/ParmFactory.h>
 #include <openvdb_houdini/Utils.h>
 #include <openvdb_houdini/SOP_NodeVDB.h>
-#include <openvdb/points/PointScatter.h>
+#include <openvdb/points/PointDelete.h>
 #include <openvdb/points/PointGroup.h>
+#include <openvdb/points/PointScatter.h>
+#include <openvdb/math/Stencils.h>
 #include <openvdb/tools/PointScatter.h>
 #include <openvdb/tools/LevelSetUtil.h>
 #include <boost/algorithm/string/join.hpp>
@@ -178,11 +180,11 @@ newSopOperator(OP_OperatorTable* table)
             "If enabled, scatter points in the interior region of a level set."
             " Otherwise, scatter points only in the narrow band."));
 
-    // an iso-surface offset for interior scattering
-    parms.add(hutil::ParmFactory(PRM_FLT_J, "offset", "Offset")
+    // scatter to the iso surface for interior and vdb points scattering
+    parms.add(hutil::ParmFactory(PRM_TOGGLE, "tosurface", "Scatter To Surface")
         .setDefault(PRMzeroDefaults)
-        .setRange(PRM_RANGE_UI, -1.0f, PRM_RANGE_UI, 1.0f)
-        .setTooltip("The offset at which to interpret the iso surface."));
+        .setTooltip("When enabled, only scatters directly up to the zero iso surface."
+                    " Only available when scattering VDB Points."));
 
     parms.add(hutil::ParmFactory(PRM_SEPARATOR, "sep2", ""));
 
@@ -253,7 +255,7 @@ SOP_OpenVDB_Scatter::updateParmsFlags()
     changed |= setVisibleState("multiply", (1 == pmode));
     changed |= setVisibleState("ppv",      (2 == pmode));
     changed |= setVisibleState("name",     (1 == vdbpoints));
-    changed |= enableParm("offset", interior);
+    changed |= enableParm("tosurface", interior == 1 && vdbpoints == 1);
 
     const auto dogroup = evalInt("dogroup", 0, 0);
     changed |= enableParm("sgroup", 1 == dogroup);
@@ -420,6 +422,53 @@ struct VDBNonUniformScatter : public BaseScatter
 }; // VDBNonUniformScatter
 
 
+template <typename SurfaceGridT>
+struct MarkPointsOutsideIso
+{
+    using GroupIndex = openvdb::points::AttributeSet::Descriptor::GroupIndex;
+    using LeafManagerT = openvdb::tree::LeafManager<openvdb::points::PointDataTree>;
+    using PositionHandleT =
+        openvdb::points::AttributeHandle<openvdb::Vec3f, openvdb::points::NullCodec>;
+    using SurfaceValueT = typename SurfaceGridT::ValueType;
+
+    MarkPointsOutsideIso(const SurfaceGridT& grid,
+                         const GroupIndex& deadIndex)
+        : mGrid(grid)
+        , mDeadIndex(deadIndex) {}
+
+    void operator()(const LeafManagerT::LeafRange& range) const {
+        openvdb::math::BoxStencil<const SurfaceGridT> stencil(mGrid);
+        for (auto leaf = range.begin(); leaf; ++leaf)  {
+
+            PositionHandleT::Ptr positionHandle =
+                PositionHandleT::create(leaf->constAttributeArray(0));
+            openvdb::points::GroupWriteHandle deadHandle =
+                leaf->groupWriteHandle(mDeadIndex);
+
+            for (auto voxel = leaf->cbeginValueOn(); voxel; ++voxel) {
+
+                const openvdb::Coord& ijk = voxel.getCoord();
+                const openvdb::Vec3d vec = ijk.asVec3d();
+
+                for (auto iter = leaf->beginIndexVoxel(ijk); iter; ++iter) {
+                    const openvdb::Index index = *iter;
+                    const openvdb::Vec3d pos = openvdb::Vec3d(positionHandle->get(index)) + vec;
+
+                    stencil.moveTo(pos);
+                    if (stencil.interpolation(pos) > openvdb::zeroVal<SurfaceValueT>()) {
+                        deadHandle.set(index, true);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    const SurfaceGridT& mGrid;
+    const GroupIndex& mDeadIndex;
+}; // MarkPointsOutsideIso
+
+
 template<typename OpType>
 inline bool
 process(const UT_VDBType type, const openvdb::GridBase& grid, OpType& op, const std::string* name)
@@ -456,6 +505,37 @@ extractInteriorMask(const openvdb::GridBase::ConstPtr grid, const float offset)
 }
 
 
+// Remove VDB Points scattered outside of a level set
+inline void
+cullVDBPoints(openvdb::points::PointDataTree& tree,
+              const openvdb::GridBase::ConstPtr grid)
+{
+    const auto leaf = tree.cbeginLeaf();
+    if (leaf) {
+        using GroupIndex = openvdb::points::AttributeSet::Descriptor::GroupIndex;
+        openvdb::points::appendGroup(tree, "dead");
+        const GroupIndex idx = leaf->attributeSet().groupIndex("dead");
+
+        openvdb::tree::LeafManager<openvdb::points::PointDataTree>
+            leafManager(tree);
+
+        if (grid->isType<openvdb::FloatGrid>()) {
+            const openvdb::FloatGrid& typedGrid =
+                static_cast<const openvdb::FloatGrid&>(*grid);
+            MarkPointsOutsideIso<openvdb::FloatGrid> mark(typedGrid, idx);
+            tbb::parallel_for(leafManager.leafRange(), mark);
+        }
+        else if (grid->isType<openvdb::DoubleGrid>()) {
+            const openvdb::DoubleGrid& typedGrid =
+                static_cast<const openvdb::DoubleGrid&>(*grid);
+            MarkPointsOutsideIso<openvdb::DoubleGrid> mark(typedGrid, idx);
+            tbb::parallel_for(leafManager.leafRange(), mark);
+        }
+        openvdb::points::deleteFromGroup(tree, "dead");
+    }
+}
+
+
 ////////////////////////////////////////
 
 
@@ -484,7 +564,6 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
         const openvdb::Index64 pointCount = evalInt("count", 0, time);
         const float ptsPerVox = static_cast<float>(evalFloat("ppv", 0, time));
         const bool interior = evalInt("interior", 0, time) != 0;
-        const float offset = static_cast<float>(evalFloat("offset", 0, time));
         const float density = static_cast<float>(evalFloat("density", 0, time));
         const bool multiplyDensity = evalInt("multiply", 0, time) != 0;
 
@@ -506,6 +585,7 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
 
         const auto pmode = evalInt("pointmode", 0, time);
         const bool vdbPoints = evalInt("vdbpoints", 0, time) == 1;
+        const bool toSurface = vdbPoints && static_cast<bool>(evalInt("tosurface", 0, time));
 
         std::vector<std::string> emptyGrids;
         std::vector<openvdb::points::PointDataGrid::Ptr> pointGrids;
@@ -528,9 +608,19 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
             const std::string* const name = verbose ? &gridName : nullptr;
             const openvdb::GridClass gridClass = grid->getGridClass();
             const bool isSignedDistance = (gridClass == openvdb::GRID_LEVEL_SET);
+            bool cullPoints = false;
 
             if (interior && isSignedDistance) {
-                grid = extractInteriorMask(grid, offset);
+                float iso = 0.0f;
+                if (toSurface) {
+                    const openvdb::Vec3d voxelSize = grid->voxelSize();
+                    const double maxVoxelSize =
+                        openvdb::math::Max(voxelSize.x(), voxelSize.y(), voxelSize.z());
+                    iso = static_cast<float>(maxVoxelSize / 2.0);
+                    cullPoints = true;
+                }
+
+                grid = extractInteriorMask(grid, iso);
                 gridType = UT_VDB_BOOL;
                 if (!grid) continue;
             }
@@ -539,7 +629,9 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
                 if (vdbPoints) { // vdb points
                     VDBUniformScatter scatter(pointCount, seed, spread, &boss);
                     if (process(gridType, *grid, scatter, name))  {
-                        pointGrids.push_back(scatter.points());
+                        openvdb::points::PointDataGrid::Ptr points = scatter.points();
+                        if (cullPoints) cullVDBPoints(points->tree(), primIter->getConstGridPtr());
+                        pointGrids.push_back(points);
                     }
                 }
                 else { // houdini points
@@ -577,7 +669,9 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
                             openvdb::Index64(density * dim.product()) * grid->activeVoxelCount();
                         VDBUniformScatter scatter(totalPointCount, seed, spread, &boss);
                         if (process(gridType, *grid, scatter, name))  {
-                            pointGrids.push_back(scatter.points());
+                            openvdb::points::PointDataGrid::Ptr points = scatter.points();
+                            if (cullPoints) cullVDBPoints(points->tree(), primIter->getConstGridPtr());
+                            pointGrids.push_back(points);
                         }
                     }
                     else { // houdini points
@@ -590,6 +684,8 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
                 if (vdbPoints) { // vdb points
                     VDBDenseUniformScatter scatter(ptsPerVox, seed, spread, &boss);
                     if (process(gridType, *grid, scatter, name))  {
+                        openvdb::points::PointDataGrid::Ptr points = scatter.points();
+                        if (cullPoints) cullVDBPoints(points->tree(), primIter->getConstGridPtr());
                         pointGrids.push_back(scatter.points());
                     }
                 }
@@ -599,6 +695,7 @@ SOP_OpenVDB_Scatter::cookMySop(OP_Context& context)
                     process(gridType, *grid, scatter, name);
                 }
             }
+
         } // for each grid
 
         if (!emptyGrids.empty()) {
