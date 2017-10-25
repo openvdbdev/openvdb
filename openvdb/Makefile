@@ -353,6 +353,7 @@ INCLUDE_NAMES := \
     points/PointDataGrid.h \
     points/PointDelete.h \
     points/PointGroup.h \
+    points/PointMask.h \
     points/StreamCompression.h \
     tools/ChangeBackground.h \
     tools/Clip.h \
@@ -457,6 +458,7 @@ UNITTEST_INCLUDE_NAMES := \
 
 UNITTEST_SRC_NAMES := \
     unittest/main.cc \
+    unittest/TestPointMask.cc \
     unittest/TestAttributeArray.cc \
     unittest/TestAttributeArrayString.cc \
     unittest/TestAttributeSet.cc \
