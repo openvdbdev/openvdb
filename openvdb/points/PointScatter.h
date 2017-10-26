@@ -327,8 +327,11 @@ uniformPointScatter(const GridT& grid,
     }
 
     tbb::parallel_sort(values.begin(), values.end());
+    const bool fractionalOnly(pointsPerVoxel == 0);
 
-    leafManager.foreach([&voxelOffsets, &values](LeafNodeType& leaf, const size_t idx) {
+    leafManager.foreach([&voxelOffsets, &values, fractionalOnly]
+                        (LeafNodeType& leaf, const size_t idx)
+    {
         const Index64 lowerOffset = voxelOffsets[idx]; // inclusive
         const Index64 upperOffset = voxelOffsets[idx + 1]; // exclusive
         assert(upperOffset > lowerOffset);
@@ -340,6 +343,7 @@ uniformPointScatter(const GridT& grid,
         auto iter = leaf.beginValueOn();
 
         Index32 currentOffset(0);
+        bool addedPoints(!fractionalOnly);
         while (lower != valuesEnd) {
             const Index64 vId = *lower;
             if (vId >= upperOffset) break;
@@ -351,12 +355,22 @@ uniformPointScatter(const GridT& grid,
 
             auto& value = data[iter.pos()];
             value = value + 1; // no += operator support
+            addedPoints = true;
             ++lower;
         }
+
+        // deactivate this leaf if no points were added. This will speed up
+        // the unthreaded rng
+        if (!addedPoints) leaf.setValuesOff();
     });
 
     voxelOffsets.clear();
     values.clear();
+
+    if (fractionalOnly) {
+        tools::pruneInactive(tree);
+        leafManager.rebuild();
+    }
 
     const AttributeSet::Descriptor::Ptr descriptor =
         AttributeSet::Descriptor::create(PositionArrayT::attributeType());
@@ -377,17 +391,18 @@ uniformPointScatter(const GridT& grid,
             leaf->setOffsetOnly(iter.pos(), offset);
         }
 
-        if (offset != 0) {
-            point_scatter_internal::generatePositions<PositionType, CodecType>
-                (*leaf, descriptor, offset, spread, rand01);
-        }
+        // offset should always be non zero
+        assert(offset != 0);
+        point_scatter_internal::generatePositions<PositionType, CodecType>
+            (*leaf, descriptor, offset, spread, rand01);
     }
 
     // if interrupted, remove remaining leaf nodes
-    const bool prune(leaf || pointsPerVoxel == 0);
-    for (; leaf; ++leaf) leaf->setValuesOff();
+    if (leaf) {
+        for (; leaf; ++leaf) leaf->setValuesOff();
+        tools::pruneInactive(tree);
+    }
 
-    if (prune) tools::pruneInactive(tree);
     if (interrupter) interrupter->end();
     return points;
 }
