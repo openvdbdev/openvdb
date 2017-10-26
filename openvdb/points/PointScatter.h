@@ -99,7 +99,8 @@ template<
     typename GridT,
     typename RandGenT = std::mt19937,
     typename PositionArrayT = TypedAttributeArray<Vec3f, NullCodec>,
-    typename PointDataGridT = Grid<typename points::TreeConverter<typename GridT::TreeType>::Type>,
+    typename PointDataGridT = Grid<
+        typename points::TreeConverter<typename GridT::TreeType>::Type>,
     typename InterrupterT = util::NullInterrupter>
 inline typename PointDataGridT::Ptr
 uniformPointScatter(const GridT& grid,
@@ -127,7 +128,8 @@ template<
     typename GridT,
     typename RandGenT = std::mt19937,
     typename PositionArrayT = TypedAttributeArray<Vec3f, NullCodec>,
-    typename PointDataGridT = Grid<typename points::TreeConverter<typename GridT::TreeType>::Type>,
+    typename PointDataGridT = Grid<
+        typename points::TreeConverter<typename GridT::TreeType>::Type>,
     typename InterrupterT = util::NullInterrupter>
 inline typename PointDataGridT::Ptr
 denseUniformPointScatter(const GridT& grid,
@@ -158,7 +160,8 @@ template<
     typename GridT,
     typename RandGenT = std::mt19937,
     typename PositionArrayT = TypedAttributeArray<Vec3f, NullCodec>,
-    typename PointDataGridT = Grid<typename points::TreeConverter<typename GridT::TreeType>::Type>,
+    typename PointDataGridT = Grid<
+        typename points::TreeConverter<typename GridT::TreeType>::Type>,
     typename InterrupterT = util::NullInterrupter>
 inline typename PointDataGridT::Ptr
 nonUniformPointScatter(const GridT& grid,
@@ -302,8 +305,9 @@ uniformPointScatter(const GridT& grid,
     const Index64 remainder = count - (pointsPerVoxel * voxelCount);
 
     if (remainder == 0) {
-        return denseUniformPointScatter<GridT, RandGenT, PositionArrayT, PointDataGridT, InterrupterT>
-            (grid, pointsPerVoxel, seed, spread, interrupter);
+        return denseUniformPointScatter<
+            GridT, RandGenT, PositionArrayT, PointDataGridT, InterrupterT>(
+                grid, pointsPerVoxel, seed, spread, interrupter);
     }
 
     std::vector<Index64> voxelOffsets, values;

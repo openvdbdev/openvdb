@@ -219,50 +219,6 @@ using PointDataTree = tree::Tree<tree::RootNode<tree::InternalNode<tree::Interna
 /// @brief Point data grid.
 using PointDataGrid = Grid<PointDataTree>;
 
-/// @brief Recursive node chain which generates a boost::mpl::vector listing
-/// value converted types of nodes to PointDataGrid nodes of the same configuration,
-/// rooted at RootNodeType in reverse order, from LeafNode to RootNode.
-/// See also TreeConverter<>.
-template<typename HeadT, Index HeadLevel>
-struct PointNodeConversionChain
-{
-    using SubtreeT = typename PointNodeConversionChain<typename HeadT::ChildNodeType, HeadLevel-1>::Type;
-    using ConvertedType = tree::RootNode<typename boost::mpl::back<SubtreeT>::type>;
-    using Type = typename boost::mpl::push_back<SubtreeT, ConvertedType>::type;
-};
-
-// Specialization for internal nodes which require their embedded child type to
-// be switched
-template <typename ChildT, Index Log2Dim, Index HeadLevel>
-struct PointNodeConversionChain<tree::InternalNode<ChildT, Log2Dim>, HeadLevel>
-{
-    using SubtreeT = typename PointNodeConversionChain<ChildT, HeadLevel-1>::Type;
-    using ConvertedType = tree::InternalNode<typename boost::mpl::back<SubtreeT>::type, Log2Dim>;
-    using Type = typename boost::mpl::push_back<SubtreeT, ConvertedType>::type;
-};
-
-// Specialization for the last internal node of a node chain, expected
-// to be templated on a leaf node
-template <typename ChildT, Index Log2Dim>
-struct PointNodeConversionChain<tree::InternalNode<ChildT, Log2Dim>, /*HeadLevel=*/1>
-{
-    using LeafNodeType = PointDataLeafNode<PointDataIndex32, ChildT::LOG2DIM>;
-    using ConvertedType = tree::InternalNode<LeafNodeType, Log2Dim>;
-    using Type = typename boost::mpl::vector<LeafNodeType, ConvertedType>::type;
-};
-
-/// @brief Similiar to ValueConverter, but allows for tree configuration conversion
-/// to a PointDataTree. ValueConverter<PointDataIndex32> cannot be used as a
-/// PointDataLeafNode is not a specialization of LeafNode
-template <typename TreeType>
-struct TreeConverter {
-private:
-    using RootNodeT = typename TreeType::RootNodeType;
-    using NodeChainT = typename PointNodeConversionChain<RootNodeT, RootNodeT::LEVEL>::Type;
-public:
-    using Type = tree::Tree<typename boost::mpl::back<NodeChainT>::type>;
-};
-
 
 /// @brief  Deep copy the descriptor across all leaf nodes.
 ///
@@ -1704,7 +1660,52 @@ void initialize();
 /// no need to call it directly.
 void uninitialize();
 
-}
+
+/// @brief Recursive node chain which generates a boost::mpl::vector listing
+/// value converted types of nodes to PointDataGrid nodes of the same configuration,
+/// rooted at RootNodeType in reverse order, from LeafNode to RootNode.
+/// See also TreeConverter<>.
+template<typename HeadT, int HeadLevel>
+struct PointDataNodeChain
+{
+    using SubtreeT = typename PointDataNodeChain<typename HeadT::ChildNodeType, HeadLevel-1>::Type;
+    using RootNodeT = tree::RootNode<typename boost::mpl::back<SubtreeT>::type>;
+    using Type = typename boost::mpl::push_back<SubtreeT, RootNodeT>::type;
+};
+
+// Specialization for internal nodes which require their embedded child type to
+// be switched
+template <typename ChildT, Index Log2Dim, int HeadLevel>
+struct PointDataNodeChain<tree::InternalNode<ChildT, Log2Dim>, HeadLevel>
+{
+    using SubtreeT = typename PointDataNodeChain<ChildT, HeadLevel-1>::Type;
+    using InternalNodeT = tree::InternalNode<typename boost::mpl::back<SubtreeT>::type, Log2Dim>;
+    using Type = typename boost::mpl::push_back<SubtreeT, InternalNodeT>::type;
+};
+
+// Specialization for the last internal node of a node chain, expected
+// to be templated on a leaf node
+template <typename ChildT, Index Log2Dim>
+struct PointDataNodeChain<tree::InternalNode<ChildT, Log2Dim>, /*HeadLevel=*/1>
+{
+    using LeafNodeT = PointDataLeafNode<PointDataIndex32, ChildT::LOG2DIM>;
+    using InternalNodeT = tree::InternalNode<LeafNodeT, Log2Dim>;
+    using Type = typename boost::mpl::vector<LeafNodeT, InternalNodeT>::type;
+};
+
+} // namespace internal
+
+
+/// @brief Similiar to ValueConverter, but allows for tree configuration conversion
+/// to a PointDataTree. ValueConverter<PointDataIndex32> cannot be used as a
+/// PointDataLeafNode is not a specialization of LeafNode
+template <typename TreeType>
+struct TreeConverter {
+    using RootNodeT = typename TreeType::RootNodeType;
+    using NodeChainT = typename internal::PointDataNodeChain<RootNodeT, RootNodeT::LEVEL>::Type;
+    using Type = tree::Tree<typename boost::mpl::back<NodeChainT>::type>;
+};
+
 
 } // namespace points
 
