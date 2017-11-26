@@ -96,11 +96,16 @@ AttributeSet::AttributeSet(const AttributeSet& attrSet, Index arrayLength)
 {
     for (const auto& namePos : mDescr->map()) {
         const size_t& pos = namePos.second;
-        AttributeArray::Ptr array = AttributeArray::create(mDescr->type(pos), arrayLength, 1);
+        const AttributeArray* other = attrSet.getConst(pos);
+        const bool constantStride = other->hasConstantStride();
+        const Index stride = constantStride ? other->stride() : other->dataSize();
+
+        AttributeArray::Ptr array = AttributeArray::create(mDescr->type(pos), arrayLength,
+            stride, constantStride);
 
         // transfer hidden and transient flags
-        if (attrSet.getConst(pos)->isHidden())      array->setHidden(true);
-        if (attrSet.getConst(pos)->isTransient())   array->setTransient(true);
+        if (other->isHidden())      array->setHidden(true);
+        if (other->isTransient())   array->setTransient(true);
 
         mAttrs[pos] = array;
     }
@@ -821,16 +826,21 @@ AttributeSet::Descriptor::create(const NamePair& positionType)
 }
 
 AttributeSet::Descriptor::Ptr
-AttributeSet::Descriptor::duplicateAppend(const Name& name, const NamePair& type) const
+AttributeSet::Descriptor::duplicateAppend(const Name& name, const NamePair& type, const Index stride) const
 {
     Inserter attributes;
 
     this->appendTo(attributes.vec);
-    attributes.add(NameAndType(name, type));
+    attributes.add(NameAndType(name, type, stride));
 
     return Descriptor::create(attributes.vec, mGroupMap, mMetadata);
 }
 
+AttributeSet::Descriptor::Ptr
+AttributeSet::Descriptor::duplicateAppend(const Name& name, const NamePair& type) const
+{
+    return this->duplicateAppend(name, type, /*stride=*/1);
+}
 
 AttributeSet::Descriptor::Ptr
 AttributeSet::Descriptor::duplicateDrop(const std::vector<size_t>& pos) const

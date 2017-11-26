@@ -323,6 +323,9 @@ public:
     static Ptr create(const NamePair&);
 
     /// Create a new descriptor as a duplicate with a new attribute appended
+    Ptr duplicateAppend(const Name& name, const NamePair& type, const Index stride) const;
+
+    /// Create a new descriptor as a duplicate with a new attribute appended
     Ptr duplicateAppend(const Name& name, const NamePair& type) const;
 
     /// Create a new descriptor as a duplicate with existing attributes dropped

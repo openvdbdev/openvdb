@@ -552,6 +552,24 @@ TestAttributeSet::testAttributeSet()
         CPPUNIT_ASSERT(attrSet2.getConst("transient")->isTransient());
     }
 
+    { // transfer of strided and dynamic attributes on construction
+        AttributeSet attrSet(Descriptor::create(AttributeVec3s::attributeType()));
+        attrSet.appendAttribute("testSingle", AttributeI::attributeType(),
+            /*stride=*/1, /*constantStride=*/true);
+        attrSet.appendAttribute("testStride", AttributeI::attributeType(),
+            /*stride=*/50, /*constantStride=*/true);
+        attrSet.appendAttribute("testDynamic", AttributeI::attributeType(),
+            /*stride=*/101, /*constantStride=*/false);
+        AttributeSet attrSet2(attrSet, size_t(1));
+        CPPUNIT_ASSERT(attrSet2.getConst("testSingle")->hasConstantStride());
+        CPPUNIT_ASSERT_EQUAL(attrSet2.getConst("testSingle")->stride(), Index(1));
+        CPPUNIT_ASSERT(attrSet2.getConst("testStride")->hasConstantStride());
+        CPPUNIT_ASSERT_EQUAL(attrSet2.getConst("testStride")->stride(), Index(50));
+        CPPUNIT_ASSERT(!attrSet2.getConst("testDynamic")->hasConstantStride());
+        CPPUNIT_ASSERT_EQUAL(attrSet2.getConst("testDynamic")->stride(), Index(1));
+        CPPUNIT_ASSERT_EQUAL(attrSet2.getConst("testDynamic")->dataSize(), Index(101));
+    }
+
     // construct
 
     { // invalid append
@@ -561,8 +579,6 @@ TestAttributeSet::testAttributeSet()
         CPPUNIT_ASSERT_THROW(invalidAttrSetA.appendAttribute("id", AttributeI::attributeType(),
             /*stride=*/0, /*constantStride=*/true), openvdb::ValueError);
         CPPUNIT_ASSERT(invalidAttrSetA.find("id") == AttributeSet::INVALID_POS);
-        CPPUNIT_ASSERT_THROW(invalidAttrSetA.appendAttribute("id", AttributeI::attributeType(),
-            /*stride=*/49, /*constantStride=*/false), openvdb::ValueError);
         CPPUNIT_ASSERT_NO_THROW(
             invalidAttrSetA.appendAttribute("testStride1", AttributeI::attributeType(),
             /*stride=*/50, /*constantStride=*/false));

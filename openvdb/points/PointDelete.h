@@ -128,11 +128,24 @@ struct DeleteByFilterOp
             std::vector<const AttributeArray*> existingAttributeArrays;
 
             for (size_t i = 0; i < attributeSetSize; i++) {
-                newAttributeArrays.push_back(newAttributeSet->get(i));
-                existingAttributeArrays.push_back(existingAttributeSet.getConst(i));
+                AttributeArray* newArray = newAttributeSet->get(i);
+                const AttributeArray* existingArray = existingAttributeSet.getConst(i);
+
+                if (!newArray->hasConstantStride() || !existingArray->hasConstantStride()) {
+                    OPENVDB_THROW(openvdb::NotImplementedError,
+                        "Transfer of attribute values for dynamic arrays not currently supported.");
+                }
+
+                if (newArray->stride() != existingArray->stride()) {
+                    OPENVDB_THROW(openvdb::LookupError,
+                        "Cannot transfer attribute values with mis-matching strides.");
+                }
+
+                newAttributeArrays.push_back(newArray);
+                existingAttributeArrays.push_back(existingArray);
             }
 
-            typename ValueType::IntType attributeIndex = 0;
+            size_t attributeIndex = 0;
             std::vector<ValueType> endOffsets;
 
             endOffsets.reserve(LeafNodeT::NUM_VALUES);
@@ -140,10 +153,10 @@ struct DeleteByFilterOp
             // now construct new attribute arrays which exclude data from deleted points
 
             for (auto voxel = leaf->cbeginValueAll(); voxel; ++voxel) {
-                for (auto iter = leaf->beginIndexVoxel(voxel.getCoord(), mFilter); iter; ++iter) {
+                for (auto iter = leaf->beginIndexVoxel(voxel.getCoord(), mFilter);
+                     iter; ++iter) {
                     for (size_t i = 0; i < attributeSetSize; i++) {
-                        newAttributeArrays[i]->set(static_cast<Index>(attributeIndex),
-                            *(existingAttributeArrays[i]), *iter);
+                        newAttributeArrays[i]->set(attributeIndex, *(existingAttributeArrays[i]), *iter);
                     }
                     ++attributeIndex;
                 }

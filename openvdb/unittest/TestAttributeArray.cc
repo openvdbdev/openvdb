@@ -413,6 +413,57 @@ TestAttributeArray::testAttributeArray()
         typedAttr.getUnsafe(0, value2);
 
         CPPUNIT_ASSERT_DOUBLES_EQUAL(double(0.2), value2, /*tolerance=*/double(0.0001));
+
+        // test set(index, sourceArray, sourceIndex) overload of set method
+        AttributeArray::Ptr attr2(new AttributeArrayD(50));
+        AttributeArrayD& typedAttr2 = static_cast<AttributeArrayD&>(*attr2);
+        AttributeArray::Ptr attr3(new  AttributeArrayD(5));
+        AttributeArrayD& typedAttr3 = static_cast<AttributeArrayD&>(*attr3);
+
+        typedAttr3.set(0, 0.2);
+        typedAttr2.set(0, *attr3, 0);
+
+        double value3 = 0.0;
+
+        // this should match index 0 of typedAttr
+        typedAttr2.get(0, value3);
+
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(0.2), value3, /*tolerance=*/double(0.0001));
+
+        // test with differing indices on both attributes.
+        typedAttr3.set(2, 5.0);
+        typedAttr2.set(3, *attr3, 2);
+        double value4 = 0.0;
+
+        typedAttr2.get(3, value4);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(5.0), value4, /*tolerance=*/double(0.0001));
+
+        // test strided arrays
+
+        AttributeArray::Ptr stridedAttr(new AttributeArrayD(5, /*stride=*/2, /*constantStride=*/true));
+        AttributeArrayD& stridedTypedAttr = static_cast<AttributeArrayD&>(*stridedAttr);
+        for (int i = 0; i < 10; i++) {
+            stridedTypedAttr.set(i, double(i));
+        }
+
+        AttributeArray::Ptr stridedAttr2(new AttributeArrayD(5, /*stride=*/2, /*constantStride=*/true));
+        AttributeArrayD& stridedTypedAttr2 = static_cast<AttributeArrayD&>(*stridedAttr2);
+
+        for (int i = 0; i < 10; i++) {
+            stridedTypedAttr2.set(i, 0);
+        }
+
+        stridedAttr2->set(3, *stridedAttr, 2);
+
+        double value5 = 0.0;
+        stridedTypedAttr2.get(5, value5);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(0), value5, /*tolerance=*/double(0.0001));
+        stridedTypedAttr2.get(6, value5);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(4), value5, /*tolerance=*/double(0.0001));
+        stridedTypedAttr2.get(7, value5);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(5), value5, /*tolerance=*/double(0.0001));
+        stridedTypedAttr2.get(8, value5);
+        CPPUNIT_ASSERT_DOUBLES_EQUAL(double(0), value5, /*tolerance=*/double(0.0001));
     }
 
     using AttributeArrayI = TypedAttributeArray<int32_t>;
@@ -719,11 +770,16 @@ TestAttributeArray::testAttributeArray()
         std::ostringstream ostr(std::ios_base::binary);
         io::setDataCompression(ostr, io::COMPRESS_BLOSC);
 
+        io::StreamMetadata::Ptr streamMetadata(new io::StreamMetadata);
+        io::setStreamMetadataPtr(ostr, streamMetadata);
+
         attrA.write(ostr);
 
         AttributeArrayI attrB;
 
         std::istringstream istr(ostr.str(), std::ios_base::binary);
+        io::setStreamMetadataPtr(istr, streamMetadata);
+
         attrB.read(istr);
 
         CPPUNIT_ASSERT(matchingNamePairs(attrA.type(), attrB.type()));
@@ -742,11 +798,13 @@ TestAttributeArray::testAttributeArray()
         attrC.setTransient(true);
 
         std::ostringstream ostrC(std::ios_base::binary);
+        io::setStreamMetadataPtr(ostrC, streamMetadata);
         attrC.write(ostrC);
 
         CPPUNIT_ASSERT_EQUAL(ostrC.str().size(), size_t(0));
 
         std::ostringstream ostrD(std::ios_base::binary);
+        io::setStreamMetadataPtr(ostrD, streamMetadata);
         attrC.write(ostrD, /*transient=*/true);
 
         CPPUNIT_ASSERT(ostrD.str().size() != size_t(0));
@@ -1013,15 +1071,36 @@ TestAttributeArray::testStrided()
     using StridedHandle         = AttributeHandle<int, /*CodecType=*/UnknownCodec>;
     using StridedWriteHandle    = AttributeWriteHandle<int, /*CodecType=*/UnknownCodec>;
 
-    { // non-strided array
+    { // empty, constant strided array
+        AttributeArrayI::Ptr array = AttributeArrayI::create(/*n=*/0, /*stride=*/2);
+        CPPUNIT_ASSERT(array->hasConstantStride());
+        CPPUNIT_ASSERT_EQUAL(array->stride(), Index(2));
+        CPPUNIT_ASSERT_EQUAL(array->size(), Index(0));
+        CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(0));
+        CPPUNIT_ASSERT(array->compact());
+    }
+
+    { // empty, dynamically strided array
+        AttributeArrayI::Ptr array = AttributeArrayI::create(/*n=*/5, /*stride=*/0, /*constantStride=*/false);
+        CPPUNIT_ASSERT(!array->hasConstantStride());
+        CPPUNIT_ASSERT_EQUAL(array->stride(), Index(1));
+        CPPUNIT_ASSERT_EQUAL(array->size(), Index(5));
+        CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(0));
+    }
+
+    { // constant non-strided array
         AttributeArrayI::Ptr array = AttributeArrayI::create(/*n=*/2, /*stride=*/1);
         CPPUNIT_ASSERT(array->hasConstantStride());
         CPPUNIT_ASSERT_EQUAL(array->stride(), Index(1));
         CPPUNIT_ASSERT_EQUAL(array->size(), Index(2));
         CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(2));
+
+        CPPUNIT_ASSERT_THROW(AttributeArrayI::resize(&(*array), /*size=*/10), openvdb::ValueError);
     }
 
-    { // strided array
+    { // constant strided array
+        CPPUNIT_ASSERT_THROW(AttributeArrayI::create(/*n=*/2, /*stride=*/0), openvdb::ValueError);
+
         AttributeArrayI::Ptr array = AttributeArrayI::create(/*n=*/2, /*stride=*/3);
 
         CPPUNIT_ASSERT(array->hasConstantStride());
@@ -1088,8 +1167,7 @@ TestAttributeArray::testStrided()
 
         CPPUNIT_ASSERT(!array->hasConstantStride());
 
-        // zero indicates dynamic striding
-        CPPUNIT_ASSERT_EQUAL(array->stride(), Index(0));
+        CPPUNIT_ASSERT_EQUAL(array->stride(), Index(1));
         CPPUNIT_ASSERT_EQUAL(array->size(), Index(2));
         // the actual array size
         CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(7));
@@ -1099,6 +1177,10 @@ TestAttributeArray::testStrided()
         CPPUNIT_ASSERT_EQUAL(array->get(6), 0);
         CPPUNIT_ASSERT_THROW(array->get(7), IndexError); // out-of-range
 
+        AttributeArrayI::resize(&(*array), /*size=*/10);
+
+        CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(10));
+
         CPPUNIT_ASSERT_NO_THROW(StridedHandle::create(*array));
         CPPUNIT_ASSERT_NO_THROW(StridedWriteHandle::create(*array));
 
@@ -1107,6 +1189,14 @@ TestAttributeArray::testStrided()
         CPPUNIT_ASSERT(!handle.hasConstantStride());
         CPPUNIT_ASSERT_EQUAL(handle.stride(), Index(1));
         CPPUNIT_ASSERT_EQUAL(handle.size(), array->dataSize());
+
+        // write handle
+        StridedWriteHandle writeHandle(*array);
+        writeHandle.resize(15);
+
+        CPPUNIT_ASSERT_EQUAL(writeHandle.size(), Index(15));
+
+        CPPUNIT_ASSERT_EQUAL(array->dataSize(), Index(15));
     }
 }
 

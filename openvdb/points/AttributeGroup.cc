@@ -124,6 +124,8 @@ bool GroupWriteHandle::collapse(bool on)
 
     GroupAttributeArray& array(const_cast<GroupAttributeArray&>(mArray));
 
+    if (array.dataSize() == 0)  return false;
+
     array.compact();
 
     if (this->isUniform()) {

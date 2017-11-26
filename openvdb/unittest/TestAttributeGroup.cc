@@ -355,6 +355,14 @@ TestAttributeGroup::testAttributeGroupHandle()
         CPPUNIT_ASSERT(writeHandle6.get(2));
         CPPUNIT_ASSERT(writeHandle6.get(3));
     }
+
+    { // empty group
+        GroupAttributeArray attr(0);
+        CPPUNIT_ASSERT_EQUAL(attr.dataSize(), Index(0));
+        CPPUNIT_ASSERT(attr.isUniform());
+        GroupWriteHandle handle(attr, /*offset=*/1);
+        CPPUNIT_ASSERT(!handle.collapse(true));
+    }
 }
 
 
