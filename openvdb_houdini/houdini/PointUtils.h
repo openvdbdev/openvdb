@@ -120,7 +120,9 @@ openvdb::points::PointDataGrid::Ptr
 convertHoudiniToPointDataGrid(
     const GU_Detail& detail,
     const int compression,
-    const AttributeInfoMap& attributes,
+    const AttributeInfoMap& pointAttributes,
+    const AttributeInfoMap& primitiveAttributes,
+    const AttributeInfoMap& vertexAttributes,
     const openvdb::math::Transform& transform);
 
 

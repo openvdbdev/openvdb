@@ -49,6 +49,9 @@
 #include <CH/CH_Manager.h> // for CHgetEvalTime
 #include <PRM/PRM_SpareData.h>
 #include <SOP/SOP_Node.h>
+#include <GU/GU_PrimPoly.h>
+#include <GEO/GEO_PrimMesh.h>
+#include <GEO/GEO_PrimPolySoup.h>
 
 #include <algorithm>
 #include <map>
@@ -58,6 +61,7 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#include <unordered_map>
 
 
 using namespace openvdb;
@@ -777,6 +781,714 @@ gaDefaultsFromDescriptor(const openvdb::points::AttributeSet::Descriptor& descri
 }
 
 
+class PrimitiveInserter
+{
+public:
+    using IndexVectorPtr = std::shared_ptr<std::vector<int>>;
+
+    static const int maxPerPrimitive = 1024;
+
+    PrimitiveInserter() = default;
+
+    void append(int count, int vertices)
+    {
+        Primitive::Ptr primitive(new Primitive(count, vertices));
+        mVertices = vertices;
+        mPrimitives.push_back(primitive);
+        mHandles.push_back(AttributeWriteHandle<int>::create(primitive->attributeArray("index")));
+        mPrimitiveIndices.push_back(std::shared_ptr<std::vector<int>>(new std::vector<int>()));
+        mPrimitiveIndices.back()->assign(count, -1);
+        mVertexIndices.push_back(std::shared_ptr<std::vector<int>>(new std::vector<int>()));
+        mVertexIndices.back()->assign(count*mVertices, -1);
+    }
+
+    void set(int actualPrimitiveIndex, int localVertexIndex, int vertexIndex, int houdiniVertexIndex)
+    {
+        int index = actualPrimitiveIndex / maxPerPrimitive;
+        int localIndex = actualPrimitiveIndex % maxPerPrimitive;
+        mHandles[index]->set(localIndex, localVertexIndex, houdiniVertexIndex);
+        std::vector<int>& indices = *(mVertexIndices[index]);
+        indices[localIndex*mVertices+localVertexIndex] = vertexIndex;
+    }
+
+    void increment(int actualPrimitiveIndex, int houdiniPrimitiveIndex)
+    {
+        int index = actualPrimitiveIndex / maxPerPrimitive;
+        int localIndex = actualPrimitiveIndex % maxPerPrimitive;
+        std::vector<int>& indices = *(mPrimitiveIndices[index]);
+        indices[localIndex] = houdiniPrimitiveIndex;
+    }
+
+    int totalPrimitives() { return mPrimitives.size(); }
+    Primitive::Ptr primitive(int i) { return mPrimitives[i]; }
+
+    int primitiveIndex() { return mPrimitiveIndex; }
+    void appendPrimitiveIndex(int value) { mPrimitiveIndex += value; }
+
+    IndexVectorPtr primitiveIndices(int i) { return mPrimitiveIndices[i]; }
+    IndexVectorPtr vertexIndices(int i) { return mVertexIndices[i]; }
+
+private:
+    int mVertices;
+    std::vector<Primitive::Ptr> mPrimitives;
+    std::vector<AttributeWriteHandle<int>::Ptr> mHandles;
+    int mPrimitiveIndex = 0;
+    std::vector<IndexVectorPtr> mPrimitiveIndices;
+    std::vector<IndexVectorPtr> mVertexIndices;
+}; // struct PrimitiveInserter
+
+
+using PrimitiveIndexPair = std::pair<Primitive::Ptr, std::shared_ptr<std::vector<int>>>;
+using PrimitiveIndexPairs = std::vector<PrimitiveIndexPair>;
+
+
+template <typename ValueType>
+struct ConvertVertexAttributeOp
+{
+    using HoudiniAttribute = HoudiniReadAttribute<ValueType>;
+
+    ConvertVertexAttributeOp(PrimitiveIndexPairs& primitives,
+        const AttributeSet::Descriptor::Ptr descriptor, AttributeSet::Descriptor::Ptr newDescriptor,
+        const size_t pos, const Index width, const GA_Attribute* const attribute)
+        : mPrimitives(primitives)
+        , mDescriptor(descriptor)
+        , mNewDescriptor(newDescriptor)
+        , mPos(pos)
+        , mWidth(width)
+        , mAttribute(attribute) { }
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+            const auto& it = mPrimitives[n];
+
+            const Index vertices = it.first->vertices();
+            AttributeSet& attributeSet = it.first->attributeSet();
+            const std::vector<int>& indices = *(it.second);
+
+            const Index stride = vertices * mWidth;
+
+            AttributeArray::Ptr array = attributeSet.appendAttribute(*mDescriptor, mNewDescriptor, mPos, stride);
+
+            HoudiniAttribute houdiniAttribute(*mAttribute);
+            AttributeWriteHandle<ValueType> handle(*array);
+
+            for (int i = 0; i < indices.size() / vertices; i++) {
+                ValueType value;
+                for (int j = 0; j < vertices; j++) {
+                    for (int k = 0; k < mWidth; k++) {
+                        houdiniAttribute.get(value, indices[i * vertices + j], k);
+                        handle.set(i, j * mWidth + k, value);
+                    }
+                }
+            }
+        }
+    }
+
+private:
+    PrimitiveIndexPairs& mPrimitives;
+    const AttributeSet::Descriptor::Ptr mDescriptor;
+    mutable AttributeSet::Descriptor::Ptr mNewDescriptor;
+    const size_t mPos;
+    const Index mWidth;
+    const GA_Attribute* const mAttribute;
+}; // struct ConvertVertexAttributeOp
+
+
+template <typename ValueType, typename CodecType = NullCodec>
+inline void
+convertVertexAttributeFromHoudini(PrimitiveIndexPairs& primitives,
+    const openvdb::Name& name, const GA_Attribute* const attribute, const Index vertices = 1, const Index width =1)
+{
+    static_assert(!std::is_base_of<AttributeArray, ValueType>::value,
+        "ValueType must not be derived from AttributeArray");
+    static_assert(!std::is_same<ValueType, openvdb::Name>::value,
+        "ValueType must not be openvdb::Name/std::string");
+
+    const NamePair type = TypedAttributeArray<ValueType, CodecType>::attributeType();
+
+    if (primitives.empty())     return;
+
+    std::stringstream ss;
+    ss << "vertex:" << name;
+
+    const auto primitive = primitives.front().first;
+    const AttributeSet::Descriptor::Ptr descriptor = primitive->attributeSet().descriptorPtr();
+    AttributeSet::Descriptor::Ptr newDescriptor = descriptor->duplicateAppend(ss.str(), type);
+    const size_t pos = newDescriptor->find(ss.str());
+
+    ConvertVertexAttributeOp<ValueType> convertOp(primitives, descriptor, newDescriptor, pos, width, attribute);
+    tbb::blocked_range<size_t> range(0, primitives.size());
+    tbb::parallel_for(range, convertOp);
+}
+
+void
+convertVertexAttributeFromHoudini(PrimitiveIndexPairs& primitives,
+    const Name& name, const GA_Attribute* const attribute, const int compression)
+{
+    if (primitives.empty())     return;
+
+    const GA_Storage storage(hvdb::attributeStorageType(attribute));
+
+    if (storage == GA_STORE_INVALID) {
+        std::stringstream ss; ss << "Invalid attribute type - " << attribute->getName();
+        throw std::runtime_error(ss.str());
+    }
+
+    const int16_t width(hvdb::attributeTupleSize(attribute));
+    assert(width > 0);
+
+    const GA_AIFTuple* tupleAIF = attribute->getAIFTuple();
+    if (!tupleAIF) {
+        std::stringstream ss; ss << "Invalid attribute type - " << attribute->getName();
+        throw std::runtime_error(ss.str());
+    }
+
+    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
+
+    const bool isVector = width == 3 && (typeInfo == GA_TYPE_VECTOR ||
+                                         typeInfo == GA_TYPE_NORMAL ||
+                                         typeInfo == GA_TYPE_COLOR);
+    const bool isQuaternion = width == 4 && (typeInfo == GA_TYPE_QUATERNION);
+    const bool isMatrix = width == 16 && (typeInfo == GA_TYPE_TRANSFORM);
+
+    using math::Vec3;
+    using math::Quat;
+    using math::Mat4;
+
+    if (isVector) {
+        if (storage == GA_STORE_INT32) {
+            convertVertexAttributeFromHoudini<Vec3<int>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into truncated 32-bit float
+            convertVertexAttributeFromHoudini<Vec3<float>, TruncateCodec>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32)
+        {
+            if (compression == hvdb::COMPRESSION_NONE) {
+                convertVertexAttributeFromHoudini<Vec3<float>>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_TRUNCATE) {
+                convertVertexAttributeFromHoudini<Vec3<float>, TruncateCodec>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_VECTOR) {
+                convertVertexAttributeFromHoudini<Vec3<float>, UnitVecCodec>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8) {
+                convertVertexAttributeFromHoudini<Vec3<float>, FixedPointCodec<true, UnitRange>>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16) {
+                convertVertexAttributeFromHoudini<Vec3<float>, FixedPointCodec<false, UnitRange>>(primitives, name, attribute);
+            }
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertVertexAttributeFromHoudini<Vec3<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown vector attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else if (isQuaternion) {
+        if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into 32-bit float
+            convertVertexAttributeFromHoudini<Quat<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32) {
+            convertVertexAttributeFromHoudini<Quat<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertVertexAttributeFromHoudini<Quat<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown quaternion attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else if (isMatrix) {
+        if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into 32-bit float
+            convertVertexAttributeFromHoudini<Mat4<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32) {
+            convertVertexAttributeFromHoudini<Mat4<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertVertexAttributeFromHoudini<Mat4<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown matrix attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else {
+        if (storage == GA_STORE_BOOL) {
+            convertVertexAttributeFromHoudini<bool>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT16) {
+            convertVertexAttributeFromHoudini<int16_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT32) {
+            convertVertexAttributeFromHoudini<int32_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT64) {
+            convertVertexAttributeFromHoudini<int64_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL16) {
+            convertVertexAttributeFromHoudini<float, TruncateCodec>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_NONE) {
+            convertVertexAttributeFromHoudini<float>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_TRUNCATE) {
+            convertVertexAttributeFromHoudini<float, TruncateCodec>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8) {
+            convertVertexAttributeFromHoudini<float, FixedPointCodec<true, UnitRange>>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16) {
+            convertVertexAttributeFromHoudini<float, FixedPointCodec<false, UnitRange>>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL64) {
+            convertVertexAttributeFromHoudini<double>(primitives, name, attribute, width);
+        } else {
+            std::stringstream ss; ss << "Unknown attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+}
+
+
+template <typename ValueType>
+struct ConvertPrimitiveAttributeOp
+{
+    using HoudiniAttribute = HoudiniReadAttribute<ValueType>;
+
+    ConvertPrimitiveAttributeOp(PrimitiveIndexPairs& primitives,
+        const AttributeSet::Descriptor::Ptr descriptor, AttributeSet::Descriptor::Ptr newDescriptor,
+        const size_t pos, const Index width, const GA_Attribute* const attribute)
+        : mPrimitives(primitives)
+        , mDescriptor(descriptor)
+        , mNewDescriptor(newDescriptor)
+        , mPos(pos)
+        , mWidth(width)
+        , mAttribute(attribute) { }
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+            const auto& it = mPrimitives[n];
+
+            AttributeSet& attributeSet = it.first->attributeSet();
+            const std::vector<int>& indices = *(it.second);
+
+            AttributeArray::Ptr array = attributeSet.appendAttribute(*mDescriptor, mNewDescriptor, mPos, mWidth);
+
+            HoudiniAttribute houdiniAttribute(*mAttribute);
+            AttributeWriteHandle<ValueType> handle(*array);
+
+            for (int i = 0; i < indices.size(); i++) {
+                ValueType value;
+                for (int j = 0; j < mWidth; j++) {
+                    houdiniAttribute.get(value, indices[i], j);
+                    handle.set(i, j, value);
+                }
+            }
+        }
+    }
+
+private:
+    PrimitiveIndexPairs& mPrimitives;
+    const AttributeSet::Descriptor::Ptr mDescriptor;
+    mutable AttributeSet::Descriptor::Ptr mNewDescriptor;
+    const size_t mPos;
+    const Index mWidth;
+    const GA_Attribute* const mAttribute;
+}; // struct ConvertPrimitiveAttributeOp
+
+
+template <typename ValueType, typename CodecType = NullCodec>
+inline void
+convertPrimitiveAttributeFromHoudini(PrimitiveIndexPairs& primitives,
+    const openvdb::Name& name, const GA_Attribute* const attribute, const Index stride = 1)
+{
+    static_assert(!std::is_base_of<AttributeArray, ValueType>::value,
+        "ValueType must not be derived from AttributeArray");
+    static_assert(!std::is_same<ValueType, openvdb::Name>::value,
+        "ValueType must not be openvdb::Name/std::string");
+
+    const NamePair type = TypedAttributeArray<ValueType, CodecType>::attributeType();
+
+    if (primitives.empty())     return;
+
+    const auto primitive = primitives.front().first;
+    const AttributeSet::Descriptor::Ptr descriptor = primitive->attributeSet().descriptorPtr();
+    AttributeSet::Descriptor::Ptr newDescriptor = descriptor->duplicateAppend(name, type);
+    const size_t pos = newDescriptor->find(name);
+
+    ConvertPrimitiveAttributeOp<ValueType> convertOp(primitives, descriptor, newDescriptor, pos, stride, attribute);
+    tbb::blocked_range<size_t> range(0, primitives.size());
+    tbb::parallel_for(range, convertOp);
+}
+
+void
+convertPrimitiveAttributeFromHoudini(PrimitiveIndexPairs& primitives,
+    const Name& name, const GA_Attribute* const attribute, const int compression)
+{
+    if (primitives.empty())     return;
+
+    const GA_Storage storage(hvdb::attributeStorageType(attribute));
+
+    if (storage == GA_STORE_INVALID) {
+        std::stringstream ss; ss << "Invalid attribute type - " << attribute->getName();
+        throw std::runtime_error(ss.str());
+    }
+
+    const int16_t width(hvdb::attributeTupleSize(attribute));
+    assert(width > 0);
+
+    const GA_AIFTuple* tupleAIF = attribute->getAIFTuple();
+    if (!tupleAIF) {
+        std::stringstream ss; ss << "Invalid attribute type - " << attribute->getName();
+        throw std::runtime_error(ss.str());
+    }
+
+    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
+
+    const bool isVector = width == 3 && (typeInfo == GA_TYPE_VECTOR ||
+                                         typeInfo == GA_TYPE_NORMAL ||
+                                         typeInfo == GA_TYPE_COLOR);
+    const bool isQuaternion = width == 4 && (typeInfo == GA_TYPE_QUATERNION);
+    const bool isMatrix = width == 16 && (typeInfo == GA_TYPE_TRANSFORM);
+
+    using math::Vec3;
+    using math::Quat;
+    using math::Mat4;
+
+    if (isVector) {
+        if (storage == GA_STORE_INT32) {
+            convertPrimitiveAttributeFromHoudini<Vec3<int>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into truncated 32-bit float
+            convertPrimitiveAttributeFromHoudini<Vec3<float>, TruncateCodec>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32)
+        {
+            if (compression == hvdb::COMPRESSION_NONE) {
+                convertPrimitiveAttributeFromHoudini<Vec3<float>>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_TRUNCATE) {
+                convertPrimitiveAttributeFromHoudini<Vec3<float>, TruncateCodec>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_VECTOR) {
+                convertPrimitiveAttributeFromHoudini<Vec3<float>, UnitVecCodec>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8) {
+                convertPrimitiveAttributeFromHoudini<Vec3<float>, FixedPointCodec<true, UnitRange>>(primitives, name, attribute);
+            }
+            else if (compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16) {
+                convertPrimitiveAttributeFromHoudini<Vec3<float>, FixedPointCodec<false, UnitRange>>(primitives, name, attribute);
+            }
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertPrimitiveAttributeFromHoudini<Vec3<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown vector attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else if (isQuaternion) {
+        if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into 32-bit float
+            convertPrimitiveAttributeFromHoudini<Quat<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32) {
+            convertPrimitiveAttributeFromHoudini<Quat<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertPrimitiveAttributeFromHoudini<Quat<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown quaternion attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else if (isMatrix) {
+        if (storage == GA_STORE_REAL16) {
+            // implicitly convert 16-bit float into 32-bit float
+            convertPrimitiveAttributeFromHoudini<Mat4<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL32) {
+            convertPrimitiveAttributeFromHoudini<Mat4<float>>(primitives, name, attribute);
+        }
+        else if (storage == GA_STORE_REAL64) {
+            convertPrimitiveAttributeFromHoudini<Mat4<double>>(primitives, name, attribute);
+        }
+        else {
+            std::stringstream ss; ss << "Unknown matrix attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+    else {
+        if (storage == GA_STORE_BOOL) {
+            convertPrimitiveAttributeFromHoudini<bool>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT16) {
+            convertPrimitiveAttributeFromHoudini<int16_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT32) {
+            convertPrimitiveAttributeFromHoudini<int32_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_INT64) {
+            convertPrimitiveAttributeFromHoudini<int64_t>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL16) {
+            convertPrimitiveAttributeFromHoudini<float, TruncateCodec>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_NONE) {
+            convertPrimitiveAttributeFromHoudini<float>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_TRUNCATE) {
+            convertPrimitiveAttributeFromHoudini<float, TruncateCodec>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8) {
+            convertPrimitiveAttributeFromHoudini<float, FixedPointCodec<true, UnitRange>>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL32 && compression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16) {
+            convertPrimitiveAttributeFromHoudini<float, FixedPointCodec<false, UnitRange>>(primitives, name, attribute, width);
+        } else if (storage == GA_STORE_REAL64) {
+            convertPrimitiveAttributeFromHoudini<double>(primitives, name, attribute, width);
+        } else {
+            std::stringstream ss; ss << "Unknown attribute type - " << name;
+            throw std::runtime_error(ss.str());
+        }
+    }
+}
+
+
+using VertexPolyMap = std::unordered_map<int, std::vector<int>>;
+using VertexSoupMap = std::unordered_map<int, std::vector<std::pair<int, int>>>;
+
+struct ComputePolyVertexMapOp
+{
+    ComputePolyVertexMapOp(const GU_Detail& detail, const std::vector<int>& indices)
+        : mDetail(detail)
+        , mIndices(indices) { }
+
+    ComputePolyVertexMapOp(ComputePolyVertexMapOp& other, tbb::split)
+        : mDetail(other.mDetail)
+        , mIndices(other.mIndices) {}
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+
+            int index = mIndices[n];
+
+            const GA_Primitive* primitive = mDetail.getPrimitiveList().get(index);
+
+            if (primitive->getTypeId() != GA_PRIMPOLY)  continue;
+
+            int vertices = primitive->getVertexCount();
+            if (mOffsets.find(vertices) == mOffsets.end()) {
+                mOffsets.insert({vertices, std::vector<int>()});
+            }
+            mOffsets[vertices].push_back(index);
+        }
+    }
+
+    void join(const ComputePolyVertexMapOp& other) {
+        for (auto otherIt : other.mOffsets) {
+            auto it = mOffsets.find(otherIt.first);
+            if (it == mOffsets.end()) {
+                mOffsets.insert({otherIt.first, otherIt.second});
+            }
+            else {
+                it->second.insert(it->second.end(), otherIt.second.begin(), otherIt.second.end());
+            }
+        }
+    }
+
+    VertexPolyMap getOffsets() const {
+        return mOffsets;
+    }
+
+private:
+    mutable VertexPolyMap mOffsets;
+    const GU_Detail& mDetail;
+    const std::vector<int>& mIndices;
+}; // struct ComputePolyVertexMapOp
+
+
+struct ComputeSoupVertexMapOp
+{
+    struct CountSoupVerticesOp
+    {
+        CountSoupVerticesOp(std::vector<int>& vertices, const GEO_PrimPolySoup& primitive)
+            : mVertices(vertices)
+            , mPrimitive(primitive) { }
+
+        void operator()(const tbb::blocked_range<size_t>& range) const {
+            for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+                mVertices[n] = mPrimitive.getPolygonSize(n);
+            }
+        }
+
+    private:
+        std::vector<int>& mVertices;
+        const GEO_PrimPolySoup& mPrimitive;
+    }; // CountSoupVerticesOp
+
+    ComputeSoupVertexMapOp(const GU_Detail& detail, const std::vector<int>& indices)
+        : mDetail(detail)
+        , mIndices(indices) { }
+
+    ComputeSoupVertexMapOp(ComputeSoupVertexMapOp& other, tbb::split)
+        : mDetail(other.mDetail)
+        , mIndices(other.mIndices) {}
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+
+            int index = mIndices[n];
+
+            const GA_Primitive* primitive = mDetail.getPrimitiveList().get(index);
+
+            if (primitive->getTypeId() != GA_PRIMPOLYSOUP)  continue;
+
+            const GEO_PrimPolySoup* soupPrimitive = static_cast<const GEO_PrimPolySoup*>(primitive);
+
+            // pre-compute vertices per polygon in parallel
+
+            std::vector<int> vertexCounts;
+            vertexCounts.reserve(soupPrimitive->getPolygonCount());
+            CountSoupVerticesOp countVerticesOp(vertexCounts, *soupPrimitive);
+            tbb::blocked_range<size_t> range(0, soupPrimitive->getPolygonCount());
+            tbb::parallel_for(range, countVerticesOp);
+
+            for (unsigned int polyIndex = 0; polyIndex < soupPrimitive->getPolygonCount(); polyIndex++) {
+                int vertices = vertexCounts[polyIndex];
+                if (mOffsets.find(vertices) == mOffsets.end()) {
+                    mOffsets.insert({vertices, std::vector<std::pair<int, int>>()});
+                }
+                mOffsets[vertices].push_back(std::pair<int, int>(index, int(polyIndex)));
+            }
+        }
+    }
+
+    void join(const ComputeSoupVertexMapOp& other) {
+        for (auto otherIt : other.mOffsets) {
+            auto it = mOffsets.find(otherIt.first);
+            if (it == mOffsets.end()) {
+                mOffsets.insert({otherIt.first, otherIt.second});
+            }
+            else {
+                it->second.insert(it->second.end(), otherIt.second.begin(), otherIt.second.end());
+            }
+        }
+    }
+
+    VertexSoupMap getOffsets() const {
+        return mOffsets;
+    }
+
+private:
+    mutable VertexSoupMap mOffsets;
+    const GU_Detail& mDetail;
+    const std::vector<int>& mIndices;
+}; // struct ComputeSoupVertexMapOp
+
+
+struct BuildPolygonsOp
+{
+    BuildPolygonsOp(PrimitiveInserter& inserter,
+                    const int vertices,
+                    const GU_Detail& detail,
+                    const std::vector<int>& offsets,
+                    const std::vector<int>& indices,
+                    const std::unordered_map<int, int>& offsetToIndexMap)
+        : mInserter(inserter)
+        , mVertices(vertices)
+        , mDetail(detail)
+        , mOffsets(offsets)
+        , mIndices(indices)
+        , mOffsetToIndexMap(offsetToIndexMap) { }
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+            int offset = mOffsets[n];
+
+            auto it = mOffsetToIndexMap.find(offset);
+            int index = it->second;
+
+            const GA_Primitive* primitive = mDetail.getPrimitiveList().get(offset);
+
+            for (GA_Size vertexIndex = 0; vertexIndex < mVertices; ++vertexIndex) {
+
+                int ptOffset = primitive->getPointOffset(vertexIndex);
+                int ptIndex = mDetail.pointIndex(ptOffset);
+
+                int vtxOffset = primitive->getVertexOffset(vertexIndex);
+                int vtxIndex = mDetail.vertexIndex(vtxOffset);
+
+                assert(ptIndex < mIndices.size());
+
+                mInserter.set(mInserter.primitiveIndex() + n, int(vertexIndex), vtxIndex, mIndices[ptIndex]);
+            }
+
+            mInserter.increment(mInserter.primitiveIndex() + n, index);
+        }
+    }
+
+private:
+    PrimitiveInserter& mInserter;
+    const int mVertices;
+    const GU_Detail& mDetail;
+    const std::vector<int>& mOffsets;
+    const std::vector<int>& mIndices;
+    const std::unordered_map<int, int>& mOffsetToIndexMap;
+}; // struct BuildPolygonsOp
+
+
+struct BuildSoupOp
+{
+    BuildSoupOp(PrimitiveInserter& inserter,
+                    const int vertices,
+                    const GU_Detail& detail,
+                    const std::vector<std::pair<int, int>>& offsets,
+                    const std::vector<int>& indices,
+                    const std::unordered_map<int, int>& offsetToIndexMap)
+        : mInserter(inserter)
+        , mVertices(vertices)
+        , mDetail(detail)
+        , mOffsets(offsets)
+        , mIndices(indices)
+        , mOffsetToIndexMap(offsetToIndexMap) { }
+
+    void operator()(const tbb::blocked_range<size_t>& range) const {
+        for (size_t n = range.begin(), N = range.end(); n != N; ++n) {
+
+            auto offsetIt = mOffsets[n];
+
+            int offset = offsetIt.first;
+            int polyOffset = offsetIt.second;
+
+            auto it = mOffsetToIndexMap.find(offset);
+            int index = it->second;
+
+            const GA_Primitive* primitive = mDetail.getPrimitiveList().get(offset);
+
+            const GEO_PrimPolySoup* soupPrimitive = static_cast<const GEO_PrimPolySoup*>(primitive);
+
+            for (GA_Size vertexIndex = 0; vertexIndex < mVertices; ++vertexIndex) {
+                int vtxOffset = soupPrimitive->getPolygonVertexOffset(polyOffset, vertexIndex);
+                int ptOffset = mDetail.vertexPoint(vtxOffset);
+
+                int vtxIndex = mDetail.vertexIndex(vtxOffset);
+                int ptIndex = mDetail.pointIndex(ptOffset);
+
+                assert(ptIndex < mIndices.size());
+
+                mInserter.set(mInserter.primitiveIndex() + n, int(vertexIndex), vtxIndex, mIndices[ptIndex]);
+            }
+
+            mInserter.increment(mInserter.primitiveIndex() + n, index);
+        }
+    }
+
+private:
+    PrimitiveInserter& mInserter;
+    const int mVertices;
+    const GU_Detail& mDetail;
+    const std::vector<std::pair<int, int>>& mOffsets;
+    const std::vector<int>& mIndices;
+    const std::unordered_map<int, int>& mOffsetToIndexMap;
+}; // struct BuildSoupOp
+
+
 } // unnamed namespace
 
 
@@ -800,12 +1512,12 @@ computeVoxelSizeFromHoudini(const GU_Detail& detail,
 
 
 PointDataGrid::Ptr
-convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
-                              const int compression,
-                              const AttributeInfoMap& attributes,
-                              const math::Transform& transform)
+convertHoudiniToPointDataGrid(
+    const GU_Detail& ptGeo, const int compression,
+    const AttributeInfoMap& pointAttributes, const AttributeInfoMap& primitiveAttributes,
+    const AttributeInfoMap& vertexAttributes, const openvdb::math::Transform& transform)
 {
-    using HoudiniPositionAttribute = HoudiniReadAttribute<Vec3d>;
+    using HoudiniPositionAttribute = HoudiniReadAttribute<openvdb::Vec3d>;
 
     // store point group information
 
@@ -815,8 +1527,8 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
 
     const GA_Attribute& positionAttribute = *ptGeo.getP();
 
-    OffsetListPtr offsets;
-    OffsetPairListPtr offsetPairs;
+    hvdb::OffsetListPtr offsets;
+    hvdb::OffsetPairListPtr offsetPairs;
 
     size_t vertexCount = 0;
 
@@ -829,17 +1541,17 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
 
         if (vertexCount == 0)  continue;
 
-        if (!offsets)   offsets.reset(new OffsetList);
+        if (!offsets)   offsets.reset(new hvdb::OffsetList);
 
         GA_Offset firstOffset = primitive->getPointOffset(0);
         offsets->push_back(firstOffset);
 
         if (vertexCount > 1) {
-            if (!offsetPairs)   offsetPairs.reset(new OffsetPairList);
+            if (!offsetPairs)   offsetPairs.reset(new hvdb::OffsetPairList);
 
             for (size_t i = 1; i < vertexCount; i++) {
                 GA_Offset offset = primitive->getPointOffset(i);
-                offsetPairs->push_back(OffsetPair(firstOffset, offset));
+                offsetPairs->push_back(hvdb::OffsetPair(firstOffset, offset));
             }
         }
     }
@@ -856,15 +1568,15 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
     PointDataGrid::Ptr pointDataGrid;
 
     if (compression == 1 /*FIXED_POSITION_16*/) {
-        pointDataGrid = points::createPointDataGrid<FixedPointCodec<false>, PointDataGrid>(
+        pointDataGrid = createPointDataGrid<FixedPointCodec<false>, PointDataGrid>(
             *pointIndexGrid, points, transform);
     }
     else if (compression == 2 /*FIXED_POSITION_8*/) {
-        pointDataGrid = points::createPointDataGrid<FixedPointCodec<true>, PointDataGrid>(
+        pointDataGrid = createPointDataGrid<FixedPointCodec<true>, PointDataGrid>(
             *pointIndexGrid, points, transform);
     }
     else /*NONE*/ {
-        pointDataGrid = points::createPointDataGrid<NullCodec, PointDataGrid>(
+        pointDataGrid = createPointDataGrid<NullCodec, PointDataGrid>(
             *pointIndexGrid, points, transform);
     }
 
@@ -900,7 +1612,7 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
         GA_Offset start, end;
         GA_Range range(**it);
         for (GA_Iterator rangeIt = range.begin(); rangeIt.blockAdvance(start, end); ) {
-            end = std::min(end, GA_Offset(numPoints));
+            end = std::min(end, numPoints);
             for (GA_Offset off = start; off < end; ++off) {
                 assert(off < numPoints);
                 inGroup[off] = short(1);
@@ -913,11 +1625,33 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
         std::fill(inGroup.begin(), inGroup.end(), short(0));
     }
 
+    // Build index mapping
+
+    std::vector<int> indices(numPoints);
+
+    using IndexT = openvdb::tools::PointIndexTree::LeafNodeType::ValueType;
+
+    const IndexT
+        *begin = static_cast<IndexT*>(nullptr),
+        *end = static_cast<IndexT*>(nullptr);
+
+    int index = 0;
+    for (auto leaf = pointIndexGrid->tree().beginLeaf(); leaf; ++leaf) {
+        for (auto iter = leaf->cbeginValueOn(); iter; ++iter) {
+            leaf->getIndices(iter.pos(), begin, end);
+
+            while (begin < end) {
+                indices[int(*begin)] = index++;
+                ++begin;
+            }
+        }
+    }
+
     // Add other attributes to PointDataGrid
 
-    for (const auto& attrInfo : attributes)
+    for (const auto& attrInfo : pointAttributes)
     {
-        const Name& name = attrInfo.first;
+        const openvdb::Name& name = attrInfo.first;
 
         // skip position as this has already been added
 
@@ -942,6 +1676,7 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
             // Iterate over the strings in the table and insert them into the Metadata
             MetaMap& metadata = makeDescriptorUnique(tree)->getMetadata();
             StringMetaInserter inserter(metadata);
+
             for (auto it = sharedStringTupleAIF->begin(gaAttribute),
                 itEnd = sharedStringTupleAIF->end(); !(it == itEnd); ++it)
             {
@@ -960,11 +1695,249 @@ convertHoudiniToPointDataGrid(const GU_Detail& ptGeo,
 
     // Apply blosc compression to attributes
 
-    for (const auto& attrInfo : attributes)
+    for (const auto& attrInfo : pointAttributes)
     {
         if (!attrInfo.second.second)  continue;
 
         bloscCompressAttribute(tree, attrInfo.first);
+    }
+
+    std::unordered_map<int, int> primOffsetToIndex;
+
+    std::vector<int> polyPrimOffsets;
+    std::vector<int> soupPrimOffsets;
+
+    for (GA_Iterator primitiveIt(ptGeo.getPrimitiveRange()); !primitiveIt.atEnd(); ++primitiveIt) {
+        primOffsetToIndex.insert({int(*primitiveIt), int(primitiveIt.getIndex())});
+
+        const GA_Primitive* primitive = ptGeo.getPrimitiveList().get(*primitiveIt);
+
+        if (primitive->getTypeId() == GA_PRIMPOLY) {
+            polyPrimOffsets.push_back(int(*primitiveIt));
+        }
+        else if (primitive->getTypeId() == GA_PRIMPOLYSOUP) {
+            soupPrimOffsets.push_back(int(*primitiveIt));
+        }
+    }
+
+    // Build primitive indices in serial
+
+    ComputePolyVertexMapOp polyVertexMapOp(ptGeo, polyPrimOffsets);
+    tbb::blocked_range<size_t> polyRange(0, polyPrimOffsets.size());
+    tbb::parallel_reduce(polyRange, polyVertexMapOp);
+
+    VertexPolyMap polyOffsets = polyVertexMapOp.getOffsets();
+
+    // TODO: this routine is slow due to the multiple redundant copies in the join of the
+    // parallel reduction, this should be converted to a parallel for with thread-local
+    // storage and instead perform the accumulation once in a serial loop
+
+    ComputeSoupVertexMapOp soupVertexMapOp(ptGeo, soupPrimOffsets);
+    tbb::blocked_range<size_t> soupRange(0, soupPrimOffsets.size());
+    tbb::parallel_reduce(soupRange, soupVertexMapOp);
+
+    VertexSoupMap soupOffsets = soupVertexMapOp.getOffsets();
+
+    // Build primitive maps
+
+    using PrimitiveMap = std::unordered_map<int, PrimitiveInserter>;
+
+    PrimitiveMap polyPrims;
+
+    for (auto it : polyOffsets) {
+        PrimitiveInserter inserter;
+        int vertices = it.first;
+        int count = it.second.size();
+        if (count == 0)     continue;
+        while (count > inserter.maxPerPrimitive) {
+            inserter.append(inserter.maxPerPrimitive, vertices);
+            count -= inserter.maxPerPrimitive;
+        }
+        if (count > 0) {
+            inserter.append(count, vertices);
+        }
+        polyPrims.insert({vertices, inserter});
+    }
+
+    PrimitiveMap soupPrims;
+
+    for (auto it : soupOffsets) {
+        PrimitiveInserter inserter;
+        int vertices = it.first;
+        int count = it.second.size();
+        if (count == 0)     continue;
+        while (count > inserter.maxPerPrimitive) {
+            inserter.append(inserter.maxPerPrimitive, vertices);
+            count -= inserter.maxPerPrimitive;
+        }
+        if (count > 0) {
+            inserter.append(count, vertices);
+        }
+        soupPrims.insert({it.first, inserter});
+    }
+
+    for (auto it : polyPrims) {
+        int vertices = it.first;
+        PrimitiveInserter& inserter = it.second;
+
+        const std::vector<int>& offsets = polyOffsets[vertices];
+
+        BuildPolygonsOp buildPolygonsOp(inserter, vertices, ptGeo, offsets, indices, primOffsetToIndex);
+        tbb::blocked_range<size_t> range(0, offsets.size());
+        tbb::parallel_for(range, buildPolygonsOp);
+
+        inserter.appendPrimitiveIndex(offsets.size());
+    }
+
+    for (auto it : soupPrims) {
+        int vertices = it.first;
+        PrimitiveInserter& inserter = it.second;
+
+        const std::vector<std::pair<int, int>>& offsets = soupOffsets[vertices];
+
+        BuildSoupOp buildSoupOp(inserter, vertices, ptGeo, offsets, indices, primOffsetToIndex);
+        tbb::blocked_range<size_t> range(0, offsets.size());
+        tbb::parallel_for(range, buildSoupOp);
+
+        inserter.appendPrimitiveIndex(offsets.size());
+    }
+
+    AttributeInfoMap primitiveAttributesToConvert;
+
+    for (const auto& attrInfo : primitiveAttributes) {
+        const openvdb::Name& name = attrInfo.first;
+
+        // skip position as primitive position is not allowed
+
+        if (name == "P")            continue;
+
+        GA_ROAttributeRef attrRef = ptGeo.findPrimitiveAttribute(name.c_str());
+        if (!attrRef.isValid())     continue;
+
+        GA_Attribute const * gaAttribute = attrRef.getAttribute();
+        if (!gaAttribute)           continue;
+
+        // no primitive string attributes currently
+
+        const GA_AIFSharedStringTuple* sharedStringTupleAIF =
+            gaAttribute->getAIFSharedStringTuple();
+        const bool isString = bool(sharedStringTupleAIF);
+        if (isString)               continue;
+
+        primitiveAttributesToConvert.insert({attrInfo.first, attrInfo.second});
+    }
+
+    AttributeInfoMap vertexAttributesToConvert;
+
+    for (const auto& attrInfo : vertexAttributes)
+    {
+        const openvdb::Name& name = attrInfo.first;
+
+        // skip position as vertex position is not allowed
+
+        if (name == "P")            continue;
+
+        GA_ROAttributeRef attrRef = ptGeo.findVertexAttribute(name.c_str());
+
+        if (!attrRef.isValid())     continue;
+
+        GA_Attribute const * gaAttribute = attrRef.getAttribute();
+
+        if (!gaAttribute)           continue;
+
+        // no vertex string attributes currently
+
+        const GA_AIFSharedStringTuple* sharedStringTupleAIF =
+            gaAttribute->getAIFSharedStringTuple();
+        const bool isString = bool(sharedStringTupleAIF);
+        if (isString)               continue;
+
+        vertexAttributesToConvert.insert({attrInfo.first, attrInfo.second});
+    }
+
+    bool hasTopology =  primitiveAttributesToConvert.size() > 0 ||
+                        vertexAttributesToConvert.size() > 0 ||
+                        polyPrims.size() > 0 ||
+                        soupPrims.size() > 0;
+
+    if (!hasTopology)   return pointDataGrid;
+
+    const openvdb::points::AttributeSet::Descriptor& constDescriptor = pointDataGrid->tree().cbeginLeaf()->attributeSet().descriptor();
+    openvdb::points::AttributeSet::Descriptor& descriptor = const_cast<openvdb::points::AttributeSet::Descriptor&>(constDescriptor);
+
+    // topology needs to be explicitly marked as enabled
+    descriptor.enableTopology();
+
+    openvdb::points::AttributeTopology& topology = descriptor.topology();
+
+    // primitive attributes
+
+    if (primitiveAttributesToConvert.size() > 0) {
+
+        PrimitiveIndexPairs primitivePrimitives;
+
+        for (auto it : polyPrims) {
+            for (int i = 0; i < it.second.totalPrimitives(); i++) {
+                primitivePrimitives.push_back(PrimitiveIndexPair(it.second.primitive(i), it.second.primitiveIndices(i)));
+            }
+        }
+        for (auto it : soupPrims) {
+            for (int i = 0; i < it.second.totalPrimitives(); i++) {
+                primitivePrimitives.push_back(PrimitiveIndexPair(it.second.primitive(i), it.second.primitiveIndices(i)));
+            }
+        }
+
+        for (const auto& attrInfo : primitiveAttributesToConvert)
+        {
+            const openvdb::Name& name = attrInfo.first;
+            GA_ROAttributeRef attrRef = ptGeo.findPrimitiveAttribute(name.c_str());
+            GA_Attribute const * gaAttribute = attrRef.getAttribute();
+
+            convertPrimitiveAttributeFromHoudini(primitivePrimitives, name, gaAttribute, attrInfo.second.first);
+        }
+    }
+
+    // vertex attributes
+
+    if (vertexAttributesToConvert.size() > 0) {
+
+        PrimitiveIndexPairs vertexPrimitives;
+
+        for (auto it : polyPrims) {
+            for (int i = 0; i < it.second.totalPrimitives(); i++) {
+                vertexPrimitives.push_back(PrimitiveIndexPair(it.second.primitive(i), it.second.vertexIndices(i)));
+            }
+        }
+        for (auto it : soupPrims) {
+            for (int i = 0; i < it.second.totalPrimitives(); i++) {
+                vertexPrimitives.push_back(PrimitiveIndexPair(it.second.primitive(i), it.second.vertexIndices(i)));
+            }
+        }
+
+        for (const auto& attrInfo : vertexAttributesToConvert)
+        {
+            const openvdb::Name& name = attrInfo.first;
+            GA_ROAttributeRef attrRef = ptGeo.findVertexAttribute(name.c_str());
+            GA_Attribute const * gaAttribute = attrRef.getAttribute();
+
+            convertVertexAttributeFromHoudini(vertexPrimitives, name, gaAttribute, attrInfo.second.first);
+        }
+    }
+
+    // attribute topology
+
+    for (auto it : polyPrims) {
+        for (int i = 0; i < it.second.totalPrimitives(); i++) {
+            auto primitive = it.second.primitive(i);
+            topology.addPrimitive(primitive);
+        }
+    }
+
+    for (auto it : soupPrims) {
+        for (int i = 0; i < it.second.totalPrimitives(); i++) {
+            auto primitive = it.second.primitive(i);
+            topology.addPrimitive(primitive);
+        }
     }
 
     return pointDataGrid;
@@ -1177,6 +2150,27 @@ convertPointDataGridToHoudini(
         HoudiniGroup group(*pointGroup, startOffset, total);
         convertPointDataGridGroup(group, tree, pointOffsets, startOffset, index,
             includeGroups, excludeGroups, inCoreOnly);
+    }
+
+    // convert topology if enabled
+    if (descriptor.isTopologyEnabled()) {
+        const openvdb::points::AttributeTopology& topology = descriptor.topology();
+
+        for (int i = 0; i < topology.size(); i++) {
+            openvdb::points::Primitive::ConstPtr primitive = topology.primitive(i);
+
+            auto handle = openvdb::points::AttributeHandle<int>::create(primitive->constAttributeArray("index"));
+
+            for (int index = 0; index < primitive->size(); index++) {
+
+                GU_PrimPoly* poly = GU_PrimPoly::build(&detail, primitive->vertices(), /*open=*/0, /*appendPoints=*/0);
+
+                for (int offset = 0; offset < primitive->vertices(); offset++) {
+                    int ptoff = handle->get(index, offset);
+                    poly->setPointOffset(offset, GA_Offset(ptoff));
+                }
+            }
+        }
     }
 }
 

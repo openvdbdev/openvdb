@@ -64,6 +64,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <unordered_map>
 
 
 using namespace openvdb;
@@ -115,6 +116,9 @@ protected:
     bool updateParmsFlags() override;
 
 private:
+    openvdb::points::PointDataGrid::Ptr
+    convertPointsToPointDataGrid(const GU_Detail* ptGeo, OP_Context& context);
+
     OUTPUT_NAME_MODE getOutputNameMode(fpreal time = 0);
 
     hvdb::Interrupter mBoss;
@@ -195,6 +199,136 @@ sopBuildAttrMenu(void* data, PRM_Name* menuEntries, int themenusize,
 
 const PRM_ChoiceList PrimAttrMenu(
     PRM_ChoiceListType(PRM_CHOICELIST_REPLACE), sopBuildAttrMenu);
+
+int computeValueCompression(SOP_Node& node, const GA_Attribute* const attribute,
+    const std::string& name, int valueCompression)
+{
+    const GA_Storage storage(hvdb::attributeStorageType(attribute));
+
+    // only tuple and string tuple attributes are supported
+
+    if (storage == GA_STORE_INVALID) {
+        std::stringstream ss; ss << "Invalid attribute type - " << name;
+        throw std::runtime_error(ss.str());
+    }
+
+    const int16_t width(hvdb::attributeTupleSize(attribute));
+    assert(width > 0);
+
+    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
+
+    const bool isVector = width == 3 && (typeInfo == GA_TYPE_VECTOR ||
+                                         typeInfo == GA_TYPE_NORMAL ||
+                                         typeInfo == GA_TYPE_COLOR);
+    const bool isQuaternion = width == 4 && (typeInfo == GA_TYPE_QUATERNION);
+    const bool isMatrix = width == 16 && (typeInfo == GA_TYPE_TRANSFORM);
+
+    // check value compression compatibility with attribute type
+
+    if (valueCompression != hvdb::COMPRESSION_NONE) {
+        if (storage == GA_STORE_STRING) {
+            // disable value compression for strings and add a SOP warning
+
+            std::stringstream ss;
+            ss << "Value compression not supported on string attributes. "
+                "Disabling compression for attribute \"" << name << "\".";
+            valueCompression = hvdb::COMPRESSION_NONE;
+#if (UT_MAJOR_VERSION_INT >= 16)
+            node.addWarning(SOP_MESSAGE, ss.str().c_str());
+#else
+            std::cerr << "Warning: " << ss.str() << std::endl;
+#endif
+        } else {
+            // disable value compression for incompatible types
+            // and add a SOP warning
+
+            if (valueCompression == hvdb::COMPRESSION_TRUNCATE &&
+                (storage != GA_STORE_REAL32 || isQuaternion || isMatrix))
+            {
+                std::stringstream ss;
+                ss << "Truncate value compression only supported for 32-bit"
+                    " floating-point attributes. Disabling compression for"
+                    " attribute \"" << name << "\".";
+                valueCompression = hvdb::COMPRESSION_NONE;
+#if (UT_MAJOR_VERSION_INT >= 16)
+            node.addWarning(SOP_MESSAGE, ss.str().c_str());
+#else
+            std::cerr << "Warning: " << ss.str() << std::endl;
+#endif
+            }
+
+            if (valueCompression == hvdb::COMPRESSION_UNIT_VECTOR &&
+                (storage != GA_STORE_REAL32 || !isVector))
+            {
+                std::stringstream ss;
+                ss << "Unit Vector value compression only supported for"
+                    " vector 3 x 32-bit floating-point attributes. "
+                    "Disabling compression for attribute \""
+                    << name << "\".";
+                valueCompression = hvdb::COMPRESSION_NONE;
+#if (UT_MAJOR_VERSION_INT >= 16)
+            node.addWarning(SOP_MESSAGE, ss.str().c_str());
+#else
+            std::cerr << "Warning: " << ss.str() << std::endl;
+#endif
+            }
+
+            const bool isUnit = (valueCompression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8
+                || valueCompression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16);
+            if (isUnit && (storage != GA_STORE_REAL32 || (width != 1 && !isVector)))
+            {
+                std::stringstream ss;
+                ss << "Unit compression only supported for scalar and vector"
+                    " 3 x 32-bit floating-point attributes. "
+                    "Disabling compression for attribute \""
+                    << name << "\".";
+                valueCompression = hvdb::COMPRESSION_NONE;
+#if (UT_MAJOR_VERSION_INT >= 16)
+            node.addWarning(SOP_MESSAGE, ss.str().c_str());
+#else
+            std::cerr << "Warning: " << ss.str() << std::endl;
+#endif
+            }
+        }
+    }
+
+    return valueCompression;
+}
+
+int computeValueCompression(SOP_Node& node, const GA_Attribute* const attribute,
+    const std::string& name, const int normalCompression, const int colorCompression)
+{
+    const GA_Storage storage(hvdb::attributeStorageType(attribute));
+
+    // only tuple and string tuple attributes are supported
+
+    if (storage == GA_STORE_INVALID) {
+        std::stringstream ss; ss << "Invalid attribute type - " << name;
+        throw std::runtime_error(ss.str());
+    }
+
+    const int16_t width(hvdb::attributeTupleSize(attribute));
+    assert(width > 0);
+
+    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
+
+    const bool isNormal = width == 3 && typeInfo == GA_TYPE_NORMAL;
+    const bool isColor = width == 3 && typeInfo == GA_TYPE_COLOR;
+
+    int valueCompression = hvdb::COMPRESSION_NONE;
+
+    if (isNormal) {
+        if (normalCompression == 1)             valueCompression = hvdb::COMPRESSION_UNIT_VECTOR;
+        else if (normalCompression == 2)        valueCompression = hvdb::COMPRESSION_TRUNCATE;
+    }
+    else if (isColor) {
+        if (colorCompression == 1)              valueCompression = hvdb::COMPRESSION_UNIT_FIXED_POINT_16;
+        else if (colorCompression == 2)         valueCompression = hvdb::COMPRESSION_UNIT_FIXED_POINT_8;
+        else if (colorCompression == 3)         valueCompression = hvdb::COMPRESSION_TRUNCATE;
+    }
+
+    return valueCompression;
+}
 
 } // unnamed namespace
 
@@ -473,6 +607,78 @@ Unit Vector:\n\
         .setChoiceListItems(PRM_CHOICELIST_SINGLE, items));
     }
 
+    parms.add(hutil::ParmFactory(PRM_HEADING, "subframeHeading", "Sub-frames"));
+
+    parms.add(hutil::ParmFactory(PRM_TOGGLE, "compactsubframes", "Compact Sub-frames")
+        .setDefault(PRMzeroDefaults)
+        .setTooltip("Only write out position and id attributes for sub-frames."));
+
+    parms.add(hutil::ParmFactory(PRM_STRING, "subframeidattribute", "Sub-frame ID Attribute")
+        .setDefault("id")
+        .setChoiceList(&PrimAttrMenu)
+        .setSpareData(&SOP_Node::theFirstInput)
+        .setTooltip("Select a point attribute to use as the sub-frame id attribute."));
+
+    parms.add(hutil::ParmFactory(PRM_HEADING, "packedHeading", "Packed Prims"));
+
+     // Mode. Either convert all or convert specifc attributes
+
+    {
+        char const * const items[] = {
+            "unpack", "Unpack All Geometry",
+            "split", "Store Packed Contents in a Separate VDB",
+            nullptr
+    };
+
+    parms.add(hutil::ParmFactory(PRM_ORD, "packedmode", "Packed Mode")
+        .setDefault(PRMzeroDefaults)
+        .setTooltip("Mode to use when encountering packed primitives.")
+        .setChoiceListItems(PRM_CHOICELIST_SINGLE, items));
+    }
+
+    //  point grid name
+    parms.add(hutil::ParmFactory(PRM_STRING, "packedname", "VDB Packed Name")
+        .setDefault("geometry")
+        .setTooltip("The name of the VDB Points primitive to be created for packed geometry."));
+
+    parms.add(hutil::ParmFactory(PRM_STRING, "packedid", "ID Attribute")
+        .setDefault("packedid")
+        .setTooltip("The name of the ID integer attribute to use for packed primitive IDs."));
+
+    parms.add(hutil::ParmFactory(PRM_STRING, "packedrot", "Rotation Attribute")
+        .setDefault("packedrot")
+        .setTooltip("The name of the rotation quaternion attribute to use for packed primitive rotations."));
+
+    parms.add(hutil::ParmFactory(PRM_STRING, "packedtrans", "Translation Attribute")
+        .setDefault("packedtrans")
+        .setTooltip(
+            "The name of the translation vector attribute to use for packed primitive pivot positions.\n"
+            "This is only used if packed primitive pivot positions are not consistent per prim."));
+
+    parms.add(hutil::ParmFactory(PRM_STRING, "packedscale", "Scale Attribute")
+        .setDefault("packedscale")
+        .setTooltip(
+            "The name of the scale vector attribute to use for packed primitive scales.\n"
+            "This is only used if packed primitive scales are not all one."));
+
+    {
+        char const * const items[] = {
+            "always", "Always",
+            "expression", "By Expression",
+            nullptr
+    };
+
+    parms.add(hutil::ParmFactory(PRM_ORD, "contentsmode", "Contents Mode")
+        .setDefault(PRMzeroDefaults)
+        .setTooltip("Mode to use when storing packed contents separately.")
+        .setChoiceListItems(PRM_CHOICELIST_SINGLE, items));
+    }
+
+    parms.add(hutil::ParmFactory(PRM_INT_J, "contentsexpression", "Contents Expression")
+        .setDefault("$FF == $RFSTART", CH_OLD_EXPRESSION)
+        .setTooltip(
+            "Store packed contents in a separate VDB if expression evaluates to non-zero."));
+
     //////////
     // Register this operator.
 
@@ -598,7 +804,291 @@ SOP_OpenVDB_Points_Convert::updateParmsFlags()
     changed |= enableParm("colorcompression", toVdbPoints && convertAll);
     changed |= setVisibleState("colorcompression", toVdbPoints && convertAll);
 
+    changed |= setVisibleState("subframeHeading", toVdbPoints);
+
+    changed |= enableParm("compactsubframes", toVdbPoints);
+    changed |= setVisibleState("compactsubframes", toVdbPoints);
+
+    const auto subframes = evalInt("compactsubframes", 0, 0) == 1;
+    changed |= enableParm("subframeidattribute", toVdbPoints && subframes);
+    changed |= setVisibleState("subframeidattribute", toVdbPoints);
+
+    changed |= setVisibleState("packedHeading", toVdbPoints);
+
+    changed |= enableParm("packedmode", toVdbPoints);
+    changed |= setVisibleState("packedmode", toVdbPoints);
+
+    const bool splitpacked = evalInt("packedmode", 0, 0) == 1;
+
+    changed |= enableParm("packedname", toVdbPoints && splitpacked);
+    changed |= setVisibleState("packedname", toVdbPoints && splitpacked);
+
+    changed |= enableParm("packedid", toVdbPoints && splitpacked);
+    changed |= setVisibleState("packedid", toVdbPoints && splitpacked);
+
+    changed |= enableParm("packedrot", toVdbPoints && splitpacked);
+    changed |= setVisibleState("packedrot", toVdbPoints && splitpacked);
+
+    changed |= enableParm("packedtrans", toVdbPoints && splitpacked);
+    changed |= setVisibleState("packedtrans", toVdbPoints && splitpacked);
+
+    changed |= enableParm("packedscale", toVdbPoints && splitpacked);
+    changed |= setVisibleState("packedscale", toVdbPoints && splitpacked);
+
+    changed |= enableParm("contentsmode", toVdbPoints && splitpacked);
+    changed |= setVisibleState("contentsmode", toVdbPoints && splitpacked);
+
+    const bool splitexpression = evalInt("contentsmode", 0, 0) == 1;
+
+    changed |= enableParm("contentsexpression", toVdbPoints && splitpacked && splitexpression);
+    changed |= setVisibleState("contentsexpression", toVdbPoints && splitpacked && splitexpression);
+
     return changed;
+}
+
+
+////////////////////////////////////////
+
+
+openvdb::points::PointDataGrid::Ptr
+SOP_OpenVDB_Points_Convert::convertPointsToPointDataGrid(const GU_Detail* ptGeo, OP_Context& context)
+{
+    const fpreal time = context.getTime();
+
+    mBoss.start();
+
+    // Set member data
+
+    Transform::Ptr transform;
+
+    // Optionally copy transform parameters from reference grid.
+
+    if (const GU_Detail* refGeo = inputGeo(1, context)) {
+
+        UT_String refvdbStr;
+        evalString(refvdbStr, "refvdb", 0, time);
+
+        const GA_PrimitiveGroup *group =
+            matchGroup(const_cast<GU_Detail&>(*refGeo), refvdbStr.toStdString());
+
+        hvdb::VdbPrimCIterator it(refGeo, group);
+        const hvdb::GU_PrimVDB* refPrim = *it;
+
+        if (!refPrim) {
+            addError(SOP_MESSAGE, "Second input has no VDB primitives.");
+            mBoss.end();
+            return openvdb::points::PointDataGrid::Ptr();
+        }
+
+        transform = refPrim->getGrid().transform().copy();
+    }
+
+    const auto transformMode = evalInt("transform", 0, time);
+
+    math::Mat4d matrix(math::Mat4d::identity());
+
+    if (transform && transformMode != TRANSFORM_REF_GRID) {
+        const math::AffineMap::ConstPtr affineMap = transform->baseMap()->getAffineMap();
+        matrix = affineMap->getMat4();
+    }
+    else if (!transform && transformMode == TRANSFORM_REF_GRID) {
+        addError(SOP_MESSAGE, "No target VDB transform found on second input.");
+        mBoss.end();
+        return openvdb::points::PointDataGrid::Ptr();
+    }
+
+    if (transformMode == TRANSFORM_TARGET_POINTS) {
+        const int pointsPerVoxel = static_cast<int>(evalInt("pointspervoxel", 0, time));
+        hvdb::Interrupter interrupter;
+        const float voxelSize = hvdb::computeVoxelSizeFromHoudini(*ptGeo, pointsPerVoxel, matrix,
+            /*decimalPlaces=*/5, interrupter);
+
+        matrix.preScale(Vec3d(voxelSize) / math::getScale(matrix));
+        transform = Transform::createLinearTransform(matrix);
+    } else if (transformMode == TRANSFORM_VOXEL_SIZE) {
+        const auto voxelSize = evalFloat("voxelsize", 0, time);
+        matrix.preScale(Vec3d(voxelSize) / math::getScale(matrix));
+        transform = Transform::createLinearTransform(matrix);
+    }
+
+    UT_String attrName;
+    hvdb::AttributeInfoMap pointAttributes;
+    hvdb::AttributeInfoMap vertexAttributes;
+    hvdb::AttributeInfoMap primitiveAttributes;
+
+    // this is a subframe if the float frame is approximately equal to the frame
+    const bool subframe = std::fabs(fpreal(context.getFrame()) - context.getFloatFrame()) >= 1e-3;
+    const bool compactSubframes = subframe && evalInt("compactsubframes", 0, time) != 0;
+    UT_String subframeIdAttributeStr;
+    evalString(subframeIdAttributeStr, "subframeidattribute", 0, time);
+    const std::string subframeIdAttribute = subframeIdAttributeStr.toStdString();
+
+    if (evalInt("mode", 0, time) != 0) {
+        // Transfer point attributes.
+        if (evalInt("attrList", 0, time) > 0) {
+            for (int i = 1, N = static_cast<int>(evalInt("attrList", 0, 0)); i <= N; ++i) {
+                evalStringInst("attribute#", &i, attrName, 0, 0);
+                const Name attributeName = Name(attrName);
+
+                const GA_ROAttributeRef pointAttrRef =
+                    ptGeo->findPointAttribute(attributeName.c_str());
+
+                if (pointAttrRef.isValid() && pointAttrRef.getAttribute()) {
+
+                    const GA_Attribute* const attribute = pointAttrRef.getAttribute();
+
+                    const bool bloscCompression = evalIntInst("blosccompression#", &i, 0, 0);
+                    int valueCompression = static_cast<int>(
+                        evalIntInst("valuecompression#", &i, 0, 0));
+                    valueCompression = computeValueCompression(*this, attribute, attributeName, valueCompression);
+
+                    // only write out P and id for sub-frames when compact sub-frames is enabled
+                    if (!compactSubframes || attributeName == subframeIdAttribute) {
+                        pointAttributes[attributeName] =
+                            std::pair<int, bool>(valueCompression, bloscCompression);
+                    }
+                }
+
+                const GA_ROAttributeRef primitiveAttrRef =
+                    ptGeo->findPrimitiveAttribute(attributeName.c_str());
+
+                if (primitiveAttrRef.isValid() && primitiveAttrRef.getAttribute()) {
+
+                    const GA_Attribute* const attribute = primitiveAttrRef.getAttribute();
+
+                    const bool bloscCompression = evalIntInst("blosccompression#", &i, 0, 0);
+                    int valueCompression = static_cast<int>(
+                        evalIntInst("valuecompression#", &i, 0, 0));
+                    valueCompression = computeValueCompression(*this, attribute, attributeName, valueCompression);
+
+                    // only write out P and index for sub-frames when compact sub-frames is enabled
+                    if (!compactSubframes || attributeName == "index") {
+                        primitiveAttributes[attributeName] =
+                            std::pair<int, bool>(valueCompression, bloscCompression);
+                    }
+                }
+
+                const GA_ROAttributeRef vertexAttrRef =
+                    ptGeo->findVertexAttribute(attributeName.c_str());
+
+                if (vertexAttrRef.isValid() && vertexAttrRef.getAttribute()) {
+
+                    const GA_Attribute* const attribute = vertexAttrRef.getAttribute();
+
+                    const bool bloscCompression = evalIntInst("blosccompression#", &i, 0, 0);
+                    int valueCompression = static_cast<int>(
+                        evalIntInst("valuecompression#", &i, 0, 0));
+                    valueCompression = computeValueCompression(*this, attribute, attributeName, valueCompression);
+
+                    if (!compactSubframes) {
+                        vertexAttributes[attributeName] =
+                            std::pair<int, bool>(valueCompression, bloscCompression);
+                    }
+                }
+            }
+        }
+    } else {
+
+        // point attribute names
+
+        const bool normalCompression = evalInt("normalcompression", 0, time) != 0;
+        const bool colorCompression = evalInt("colorcompression", 0, time) != 0;
+
+        for (auto iter = ptGeo->pointAttribs().begin(GA_SCOPE_PUBLIC); !iter.atEnd(); ++iter) {
+            const char* str = (*iter)->getName();
+            if (!str) continue;
+
+            const Name attributeName = str;
+
+            if (attributeName == "P") continue;
+
+            // only write out P and id for sub-frames when compact sub-frames is enabled
+            if (compactSubframes & attributeName != subframeIdAttribute)  continue;
+
+            const GA_ROAttributeRef attrRef =
+                ptGeo->findPointAttribute(attributeName.c_str());
+
+            if (attrRef.isValid() && attrRef.getAttribute()) {
+
+                const GA_Attribute* const attribute = attrRef.getAttribute();
+
+                const int valueCompression = computeValueCompression(*this, attribute, attributeName,
+                    normalCompression, colorCompression);
+
+                // when converting all attributes apply no compression
+                pointAttributes[attributeName] = std::pair<int, bool>(valueCompression, false);
+            }
+        }
+
+        for (auto iter = ptGeo->primitiveAttribs().begin(GA_SCOPE_PUBLIC); !iter.atEnd(); ++iter) {
+            const char* str = (*iter)->getName();
+            if (!str) continue;
+
+            const Name attributeName = str;
+
+            if (attributeName == "P") continue;
+
+            // only write out P and index for sub-frames when compact sub-frames is enabled
+            if (compactSubframes & attributeName != "index")  continue;
+
+            const GA_ROAttributeRef attrRef =
+                ptGeo->findPrimitiveAttribute(attributeName.c_str());
+
+            if (attrRef.isValid() && attrRef.getAttribute()) {
+
+                const GA_Attribute* const attribute = attrRef.getAttribute();
+
+                const int valueCompression = computeValueCompression(*this, attribute, attributeName,
+                    normalCompression, colorCompression);
+
+                // when converting all attributes apply no compression
+                primitiveAttributes[attributeName] = std::pair<int, bool>(valueCompression, false);
+            }
+        }
+
+        for (auto iter = ptGeo->vertexAttribs().begin(GA_SCOPE_PUBLIC); !iter.atEnd(); ++iter) {
+            const char* str = (*iter)->getName();
+            if (!str) continue;
+
+            const Name attributeName = str;
+
+            if (attributeName == "P")   continue;
+            if (compactSubframes)       continue;
+
+            const GA_ROAttributeRef attrRef =
+                ptGeo->findVertexAttribute(attributeName.c_str());
+
+            if (attrRef.isValid() && attrRef.getAttribute()) {
+
+                const GA_Attribute* const attribute = attrRef.getAttribute();
+
+                const int valueCompression = computeValueCompression(*this, attribute, attributeName,
+                    normalCompression, colorCompression);
+
+                // when converting all attributes apply no compression
+                vertexAttributes[attributeName] = std::pair<int, bool>(valueCompression, false);
+            }
+        }
+    }
+
+    // Determine position compression
+
+    const int positionCompression = static_cast<int>(evalInt("poscompression", 0, time));
+
+    PointDataGrid::Ptr pointDataGrid = hvdb::convertHoudiniToPointDataGrid(
+        *ptGeo, positionCompression, pointAttributes,
+        primitiveAttributes, vertexAttributes, *transform);
+
+    std::vector<std::string> warnings;
+    hvdb::populateMetadataFromHoudini(*pointDataGrid, warnings, *ptGeo);
+
+    for (const auto& warning : warnings) {
+        addWarning(SOP_MESSAGE, warning.c_str());
+    }
+
+    mBoss.end();
+
+    return pointDataGrid;
 }
 
 
@@ -837,260 +1327,455 @@ SOP_OpenVDB_Points_Convert::cookMySop(OP_Context& context)
 
         gdp->clearAndDestroy();
 
-        const GU_Detail* ptGeo = inputGeo(0, context);
+        const GU_Detail* geo = inputGeo(0, context);
 
-        const auto transformMode = evalInt("transform", 0, time);
+        GU_Detail tempGeo;
+        const GU_Detail* newGeo;
 
-        math::Mat4d matrix(math::Mat4d::identity());
+        const bool unpackAllGeo = evalInt("packedmode", 0, time) == 0;
+        const bool useExpression = evalInt("contentsmode", 0, time) == 1;
 
-        if (transform && transformMode != TRANSFORM_REF_GRID) {
-            const math::AffineMap::ConstPtr affineMap = transform->baseMap()->getAffineMap();
-            matrix = affineMap->getMat4();
-        }
-        else if (!transform && transformMode == TRANSFORM_REF_GRID) {
-            addError(SOP_MESSAGE, "No target VDB transform found on second input.");
-            return error();
-        }
+        bool convertContents = !unpackAllGeo;
 
-        if (transformMode == TRANSFORM_TARGET_POINTS) {
-            const int pointsPerVoxel = static_cast<int>(evalInt("pointspervoxel", 0, time));
-            const float voxelSize =
-                hvdb::computeVoxelSizeFromHoudini(*ptGeo, pointsPerVoxel,
-                    matrix, /*rounding*/ 5, mBoss);
+        // disable if expression is enabled and evaluates to zero
 
-            matrix.preScale(Vec3d(voxelSize) / math::getScale(matrix));
-            transform = Transform::createLinearTransform(matrix);
-        } else if (transformMode == TRANSFORM_VOXEL_SIZE) {
-            const auto voxelSize = evalFloat("voxelsize", 0, time);
-            matrix.preScale(Vec3d(voxelSize) / math::getScale(matrix));
-            transform = Transform::createLinearTransform(matrix);
+        if (convertContents && useExpression &&
+            evalInt("contentsexpression", 0, time) == 0) {
+            convertContents = false;
         }
 
-        UT_String attrName;
-        openvdb_houdini::AttributeInfoMap attributes;
+        bool consistentPivots = true;
+        bool containsScale = false;
 
-        GU_Detail nonConstDetail;
-        const GU_Detail* detail;
+        std::unordered_map<int, std::unordered_map<std::string, int>> packedFragmentMap;
 
-        // unpack any packed primitives
+        if (unpackAllGeo) {
+            // unpack any packed primitives
 
-        mBoss.start();
+            for (GA_Iterator it(geo->getPrimitiveRange()); !it.atEnd(); ++it)
+            {
+                GA_Offset offset = *it;
 
-        for (GA_Iterator it(ptGeo->getPrimitiveRange()); !it.atEnd(); ++it)
-        {
-            GA_Offset offset = *it;
+                const GA_Primitive* primitive = geo->getPrimitive(offset);
+                if (!primitive || !GU_PrimPacked::isPackedPrimitive(*primitive)) continue;
 
-            const GA_Primitive* primitive = ptGeo->getPrimitive(offset);
-            if (!primitive || !GU_PrimPacked::isPackedPrimitive(*primitive)) continue;
+                const GU_PrimPacked* packedPrimitive = static_cast<const GU_PrimPacked*>(primitive);
 
-            const GU_PrimPacked* packedPrimitive = static_cast<const GU_PrimPacked*>(primitive);
+                packedPrimitive->unpack(tempGeo);
+            }
 
-            packedPrimitive->unpack(nonConstDetail);
-        }
+            if (geo->getNumPoints() > 0 && tempGeo.getNumPoints() == 0) {
+                // only unpacked points exist so just use the input gdp
 
-        if (ptGeo->getNumPoints() > 0 && nonConstDetail.getNumPoints() == 0) {
-            // only unpacked points exist so just use the input gdp
+                newGeo = geo;
+            }
+            else {
+                // merge unpacked and packed point data
 
-            detail = ptGeo;
+                tempGeo.mergePoints(*geo);
+                newGeo = &tempGeo;
+            }
         }
         else {
-            // merge unpacked and packed point data
 
-            nonConstDetail.mergePoints(*ptGeo);
-            detail = &nonConstDetail;
-        }
+            // copy the detail so that we can modify the packed data
 
-        if (evalInt("mode", 0, time) != 0) {
-            // Transfer point attributes.
-            if (evalInt("attrList", 0, time) > 0) {
-                for (int i = 1, N = static_cast<int>(evalInt("attrList", 0, 0)); i <= N; ++i) {
-                    evalStringInst("attribute#", &i, attrName, 0, 0);
-                    const Name attributeName = Name(attrName);
+            GU_Detail packedDetail;
+            packedDetail.baseMerge(*geo);
 
-                    const GA_ROAttributeRef attrRef =
-                        detail->findPointAttribute(attributeName.c_str());
+            // extract all packed prims and force load them
 
-                    if (!attrRef.isValid()) continue;
+            std::vector<GU_PrimPacked*> packedPrimitives;
 
-                    const GA_Attribute* const attribute = attrRef.getAttribute();
+            for (GA_Iterator it(packedDetail.getPrimitiveRange()); !it.atEnd(); ++it)
+            {
+                GA_Offset offset = *it;
 
-                    if (!attribute) continue;
+                GA_Primitive* primitive = packedDetail.getPrimitive(offset);
+                if (!primitive || !GU_PrimPacked::isPackedPrimitive(*primitive)) continue;
 
-                    const GA_Storage storage(hvdb::attributeStorageType(attribute));
+                GU_PrimPacked* packedPrimitive = static_cast<GU_PrimPacked*>(primitive);
 
-                    // only tuple and string tuple attributes are supported
-
-                    if (storage == GA_STORE_INVALID) {
-                        std::stringstream ss; ss << "Invalid attribute type - " << attributeName;
-                        throw std::runtime_error(ss.str());
+                GU_PackedImpl* packedImpl = packedPrimitive->implementation();
+                if (packedImpl) {
+                    GU_PackedGeometry* packedGeo = dynamic_cast<GU_PackedGeometry*>(packedImpl);
+                    GU_PackedFragment* packedFragment = dynamic_cast<GU_PackedFragment*>(packedImpl);
+                    if (packedGeo)                  packedGeo->forceLoad();
+                    else if (packedFragment)        packedFragment->forceLoad();
+                    else {
+                        // unknown packed implementation
+                        continue;
                     }
-
-                    const int16_t width(hvdb::attributeTupleSize(attribute));
-                    assert(width > 0);
-
-                    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
-
-                    const bool isVector = width == 3 && (typeInfo == GA_TYPE_VECTOR ||
-                                                         typeInfo == GA_TYPE_NORMAL ||
-                                                         typeInfo == GA_TYPE_COLOR);
-                    const bool isQuaternion = width == 4 && (typeInfo == GA_TYPE_QUATERNION);
-                    const bool isMatrix = width == 16 && (typeInfo == GA_TYPE_TRANSFORM);
-
-                    const bool bloscCompression = evalIntInst("blosccompression#", &i, 0, 0);
-                    int valueCompression = static_cast<int>(
-                        evalIntInst("valuecompression#", &i, 0, 0));
-
-                    // check value compression compatibility with attribute type
-
-                    if (valueCompression != hvdb::COMPRESSION_NONE) {
-                        if (storage == GA_STORE_STRING) {
-                            // disable value compression for strings and add a SOP warning
-
-                            std::stringstream ss;
-                            ss << "Value compression not supported on string attributes. "
-                                "Disabling compression for attribute \"" << attributeName << "\".";
-                            valueCompression = hvdb::COMPRESSION_NONE;
-                            addWarning(SOP_MESSAGE, ss.str().c_str());
-                        } else {
-                            // disable value compression for incompatible types
-                            // and add a SOP warning
-
-                            if (valueCompression == hvdb::COMPRESSION_TRUNCATE &&
-                                (storage != GA_STORE_REAL32 || isQuaternion || isMatrix))
-                            {
-                                std::stringstream ss;
-                                ss << "Truncate value compression only supported for 32-bit"
-                                    " floating-point attributes. Disabling compression for"
-                                    " attribute \"" << attributeName << "\".";
-                                valueCompression = hvdb::COMPRESSION_NONE;
-                                addWarning(SOP_MESSAGE, ss.str().c_str());
-                            }
-
-                            if (valueCompression == hvdb::COMPRESSION_UNIT_VECTOR &&
-                                (storage != GA_STORE_REAL32 || !isVector))
-                            {
-                                std::stringstream ss;
-                                ss << "Unit Vector value compression only supported for"
-                                    " vector 3 x 32-bit floating-point attributes. "
-                                    "Disabling compression for attribute \""
-                                    << attributeName << "\".";
-                                valueCompression = hvdb::COMPRESSION_NONE;
-                                addWarning(SOP_MESSAGE, ss.str().c_str());
-                            }
-
-                            const bool isUnit =
-                                (valueCompression == hvdb::COMPRESSION_UNIT_FIXED_POINT_8
-                              || valueCompression == hvdb::COMPRESSION_UNIT_FIXED_POINT_16);
-                            if (isUnit && (storage != GA_STORE_REAL32 || (width != 1 && !isVector)))
-                            {
-                                std::stringstream ss;
-                                ss << "Unit compression only supported for scalar and vector"
-                                    " 3 x 32-bit floating-point attributes. "
-                                    "Disabling compression for attribute \""
-                                    << attributeName << "\".";
-                                valueCompression = hvdb::COMPRESSION_NONE;
-                                addWarning(SOP_MESSAGE, ss.str().c_str());
-                            }
-                        }
-                    }
-
-                    attributes[attributeName] =
-                        std::pair<int, bool>(valueCompression, bloscCompression);
+                    packedPrimitives.push_back(packedPrimitive);
                 }
             }
-        } else {
 
-            // point attribute names
-            auto iter = detail->pointAttribs().begin(GA_SCOPE_PUBLIC);
+            // determine if there are any packed prims that reference the same detail,
+            // but with a different pivot
 
-            const auto normalCompression = evalInt("normalcompression", 0, time);
-            const auto colorCompression = evalInt("colorcompression", 0, time);
+            std::unordered_map<int, UT_Vector3D> pivots;
 
-            if (!iter.atEnd()) {
-                for (; !iter.atEnd(); ++iter) {
-                    const char* str = (*iter)->getName();
-                    if (!str) continue;
+            // TODO: this should also handle packed fragment intrinsics
 
-                    const Name attributeName = str;
+            for (auto& packedPrimitive : packedPrimitives) {
+                GU_PackedImpl* packedImpl = packedPrimitive->implementation();
+                GU_PackedGeometry* packedGeo = dynamic_cast<GU_PackedGeometry*>(packedImpl);
+                GU_PackedFragment* packedFragment = dynamic_cast<GU_PackedFragment*>(packedImpl);
+                const int id = packedGeo ? packedGeo->geometryId() : packedFragment->geometryId();
 
-                    if (attributeName == "P") continue;
+                if (consistentPivots) {
+                    auto it = pivots.find(id);
 
-                    const GA_ROAttributeRef attrRef =
-                        detail->findPointAttribute(attributeName.c_str());
+                    if (it == pivots.end()) {
+                        pivots.insert({id, packedPrimitive->pivot()});
+                    }
+                    else if (it->second != packedPrimitive->pivot()) {
+                        consistentPivots = false;
+                    }
+                }
 
-                    if (!attrRef.isValid()) continue;
-
-                    const GA_Attribute* const attribute = attrRef.getAttribute();
-
-                    if (!attribute) continue;
-
-                    const GA_Storage storage(hvdb::attributeStorageType(attribute));
-
-                    // only tuple and string tuple attributes are supported
-
-                    if (storage == GA_STORE_INVALID) {
-                        std::stringstream ss; ss << "Invalid attribute type - " << attributeName;
+                if (!containsScale) {
+                    const double tolerance = 1e-5;
+                    UT_Vector3D scale;
+                    UT_Vector3D shear;
+                    UT_Matrix3D localTransform = packedPrimitive->localTransform();
+                    localTransform.extractScales(scale, &shear);
+                    if (shear.x() < -tolerance || shear.x() > tolerance ||
+                        shear.y() < -tolerance || shear.y() > tolerance ||
+                        shear.z() < -tolerance || shear.z() > tolerance)
+                    {
+                        std::stringstream ss; ss << "Shear Not Supported in Packed Prim Matrices - " << shear;
                         throw std::runtime_error(ss.str());
                     }
-
-                    const int16_t width(hvdb::attributeTupleSize(attribute));
-                    assert(width > 0);
-
-                    const GA_TypeInfo typeInfo(attribute->getOptions().typeInfo());
-
-                    const bool isNormal = width == 3 && typeInfo == GA_TYPE_NORMAL;
-                    const bool isColor = width == 3 && typeInfo == GA_TYPE_COLOR;
-
-                    int valueCompression = hvdb::COMPRESSION_NONE;
-
-                    if (isNormal) {
-                        if (normalCompression == 1) {
-                            valueCompression = hvdb::COMPRESSION_UNIT_VECTOR;
-                        } else if (normalCompression == 2) {
-                            valueCompression = hvdb::COMPRESSION_TRUNCATE;
-                        }
+                    if (scale.x() < 1.0-tolerance || scale.x() > 1.0+tolerance ||
+                        scale.y() < 1.0-tolerance || scale.y() > 1.0+tolerance ||
+                        scale.z() < 1.0-tolerance || scale.z() > 1.0+tolerance)
+                    {
+                        containsScale = true;
                     }
-                    else if (isColor) {
-                        if (colorCompression == 1) {
-                            valueCompression = hvdb::COMPRESSION_UNIT_FIXED_POINT_16;
-                        } else if (colorCompression == 2) {
-                            valueCompression = hvdb::COMPRESSION_UNIT_FIXED_POINT_8;
-                        } else if (colorCompression == 3) {
-                            valueCompression = hvdb::COMPRESSION_TRUNCATE;
-                        }
-                    }
+                }
 
-                    // when converting all attributes apply no compression
-                    attributes[attributeName] = std::pair<int, bool>(valueCompression, false);
+                if (!consistentPivots && containsScale)  break;
+            }
+
+            // build a packed fragment map for computing primitive ids
+
+            {
+                // extract packed fragment names
+
+                std::unordered_map<int, std::vector<std::string>> fragments;
+                for (auto& packedPrimitive : packedPrimitives) {
+                    GU_PackedImpl* packedImpl = packedPrimitive->implementation();
+                    GU_PackedFragment* packedFragment = dynamic_cast<GU_PackedFragment*>(packedImpl);
+                    if (packedFragment) {
+                        const int id = packedFragment->geometryId();
+                        if (fragments.find(id) == fragments.end()) {
+                            fragments.insert({id, std::vector<std::string>()});
+                        }
+                        std::vector<std::string>& names = fragments[id];
+                        names.push_back(packedFragment->name().toStdString());
+                    }
+                }
+
+                // sort fragments and build the fragment map
+
+                for (auto it : fragments) {
+                    std::sort(it.second.begin(), it.second.end());
+
+                    packedFragmentMap.insert({it.first, std::unordered_map<std::string, int>()});
+                    std::unordered_map<std::string, int>& localFragmentMap = packedFragmentMap[it.first];
+                    int i = 0;
+                    for (auto fragmentIt : it.second) {
+                        localFragmentMap.insert({fragmentIt, i++});
+                    }
                 }
             }
+
+            if (convertContents) {
+
+                std::string idName;
+                {
+                    UT_String nameStr = "";
+                    evalString(nameStr, "packedid", 0, time);
+                    idName = nameStr.toStdString();
+                    if (idName.empty()) {
+                        idName = "packedid";
+                    }
+                }
+
+                // zero the point position
+
+                GA_RWHandleF posHandle(packedDetail.getP());
+                for (int i = 0; i < packedDetail.getNumPoints(); i++)
+                {
+                    posHandle.set(GA_Offset(i), 0, 0.0f);
+                    posHandle.set(GA_Offset(i), 1, 0.0f);
+                    posHandle.set(GA_Offset(i), 2, 0.0f);
+                }
+
+                std::set<long> geometryIds;
+
+                for (auto& packedPrimitive : packedPrimitives) {
+                    GU_PackedImpl* packedImpl = packedPrimitive->implementation();
+                    GU_PackedGeometry* packedGeo = dynamic_cast<GU_PackedGeometry*>(packedImpl);
+                    GU_PackedFragment* packedFragment = dynamic_cast<GU_PackedFragment*>(packedImpl);
+
+                    long id = packedGeo ? packedGeo->geometryId() : packedFragment->geometryId();
+
+                    if (packedFragment) {
+                        std::string name = packedFragment->name().toStdString();
+                        std::unordered_map<std::string, int>& localFragmentMap = packedFragmentMap[id];
+                        const long localId = localFragmentMap[name];
+                        id = (id << 32) | localId;
+                    }
+
+                    if (geometryIds.find(id) == geometryIds.end()) {
+
+                        const UT_Matrix3D& localTransform = packedPrimitive->localTransform();
+
+                        if (!localTransform.isIdentity()) {
+
+                            // apply inverse transform so that packed contents are located at the origin
+
+                            UT_Matrix4 transform(UT_Matrix4::getIdentityMatrix());
+                            transform(0,0) = localTransform(0,0);
+                            transform(0,1) = localTransform(0,1);
+                            transform(0,2) = localTransform(0,2);
+                            transform(1,0) = localTransform(1,0);
+                            transform(1,1) = localTransform(1,1);
+                            transform(1,2) = localTransform(1,2);
+                            transform(2,0) = localTransform(2,0);
+                            transform(2,1) = localTransform(2,1);
+                            transform(2,2) = localTransform(2,2);
+
+                            // translate geometry back to origin to remove the need for a pivot
+                            // if they're consistent
+                            if (consistentPivots) {
+                                transform.translate(packedPrimitive->pivot());
+                            }
+                            transform.invert();
+
+                            packedPrimitive->transform(transform);
+                        }
+
+                        GU_Detail unpackedDetail;
+                        packedPrimitive->unpack(unpackedDetail);
+
+                        GA_RWHandleI idHandle32;
+                        GA_RWHandleID idHandle64;
+
+                        GA_RWAttributeRef idAttributeRef;
+
+                        if (packedFragmentMap.size() > 0) {
+                            idAttributeRef = unpackedDetail.addTuple(GA_STORE_INT64, GA_ATTRIB_PRIMITIVE, idName, 1);
+                            idHandle64.bind(idAttributeRef.getAttribute());
+                        }
+                        else {
+                            idAttributeRef = unpackedDetail.addTuple(GA_STORE_INT32, GA_ATTRIB_PRIMITIVE, idName, 1);
+                            idHandle32.bind(idAttributeRef.getAttribute());
+                        }
+
+                        idAttributeRef.getAttribute()->hardenAllPages();
+
+                        for (int i = 0; i < unpackedDetail.getNumPrimitives(); i++)
+                        {
+                            if (packedFragmentMap.size() > 0) {
+                                idHandle64.set(GA_Offset(i), 0, id);
+                            }
+                            else {
+                                idHandle32.set(GA_Offset(i), 0, int(id));
+                            }
+                        }
+
+                        tempGeo.baseMerge(unpackedDetail);
+                        newGeo = &tempGeo;
+
+                        geometryIds.insert(id);
+                    }
+                }
+
+                openvdb::points::PointDataGrid::Ptr geometry = convertPointsToPointDataGrid(newGeo, context);
+
+                if (geometry) {
+                    UT_String nameStr = "";
+                    evalString(nameStr, "packedname", 0, time);
+                    hvdb::createVdbPrimitive(*gdp, geometry, nameStr.toStdString().c_str());
+                }
+            }
+
+            newGeo = geo;
         }
 
-        // Determine position compression
+        GU_Detail pointsTempGeo;
+        pointsTempGeo.baseMerge(*geo);
 
-        const int positionCompression = static_cast<int>(evalInt("poscompression", 0, time));
+        if (!unpackAllGeo) {
 
-        PointDataGrid::Ptr pointDataGrid = hvdb::convertHoudiniToPointDataGrid(
-            *detail, positionCompression, attributes, *transform);
+            std::string idName;
+            {
+                UT_String nameStr = "";
+                evalString(nameStr, "packedid", 0, time);
+                idName = nameStr.toStdString();
+                if (idName.empty()) {
+                    idName = "packedid";
+                }
+            }
 
-        std::vector<std::string> warnings;
-        hvdb::populateMetadataFromHoudini(*pointDataGrid, warnings, *detail);
+            std::string rotName;
+            {
+                UT_String nameStr = "";
+                evalString(nameStr, "packedrot", 0, time);
+                rotName = nameStr.toStdString();
+                if (rotName.empty()) {
+                    rotName = "packedrot";
+                }
+            }
 
-        for (const auto& warning : warnings) {
-            addWarning(SOP_MESSAGE, warning.c_str());
+            std::string transName;
+            {
+                UT_String nameStr = "";
+                evalString(nameStr, "packedtrans", 0, time);
+                transName = nameStr.toStdString();
+                if (transName.empty()) {
+                    transName = "packedtrans";
+                }
+            }
+
+            std::string scaleName;
+            {
+                UT_String nameStr = "";
+                evalString(nameStr, "packedscale", 0, time);
+                scaleName = nameStr.toStdString();
+                if (scaleName.empty()) {
+                    scaleName = "packedscale";
+                }
+            }
+
+            GA_RWHandleF translateHandle;
+            GA_RWHandleF scaleHandle;
+            GA_RWHandleF rotateHandle;
+
+            GA_RWHandleI idHandle32;
+            GA_RWHandleID idHandle64;
+
+            GA_RWAttributeRef translateAttributeRef;
+            if (!consistentPivots) {
+                translateAttributeRef = pointsTempGeo.addTuple(GA_STORE_REAL32, GA_ATTRIB_POINT, transName, /*width=*/3);
+                translateAttributeRef->getOptions().setTypeInfo(GA_TYPE_VECTOR);
+                translateAttributeRef.getAttribute()->hardenAllPages();
+                translateHandle.bind(translateAttributeRef.getAttribute());
+            }
+
+            GA_RWAttributeRef scaleAttributeRef;
+            if (containsScale) {
+                scaleAttributeRef = pointsTempGeo.addTuple(GA_STORE_REAL32, GA_ATTRIB_POINT, scaleName, /*width=*/3);
+                scaleAttributeRef->getOptions().setTypeInfo(GA_TYPE_VECTOR);
+                scaleAttributeRef.getAttribute()->hardenAllPages();
+                scaleHandle.bind(scaleAttributeRef.getAttribute());
+            }
+
+            GA_RWAttributeRef rotateAttributeRef = pointsTempGeo.addTuple(GA_STORE_REAL32, GA_ATTRIB_POINT, rotName, /*width=*/4);
+            rotateAttributeRef->getOptions().setTypeInfo(GA_TYPE_QUATERNION);
+            rotateAttributeRef.getAttribute()->hardenAllPages();
+            rotateHandle.bind(rotateAttributeRef.getAttribute());
+
+            GA_RWAttributeRef idAttributeRef;
+            if (packedFragmentMap.size() > 0) {
+                idAttributeRef = pointsTempGeo.addTuple(GA_STORE_INT64, GA_ATTRIB_POINT, idName, 1);
+                idHandle64.bind(idAttributeRef.getAttribute());
+            }
+            else {
+                idAttributeRef = pointsTempGeo.addTuple(GA_STORE_INT32, GA_ATTRIB_POINT, idName, 1);
+                idHandle32.bind(idAttributeRef.getAttribute());
+            }
+
+            for (GA_Iterator it(pointsTempGeo.getPrimitiveRange()); !it.atEnd(); ++it)
+            {
+                GA_Offset offset = *it;
+
+                GA_Primitive* primitive = pointsTempGeo.getPrimitive(offset);
+                if (!primitive || !GU_PrimPacked::isPackedPrimitive(*primitive))    continue;
+
+                GU_PrimPacked* packedPrimitive = static_cast<GU_PrimPacked*>(primitive);
+                GU_PackedImpl* packedImpl = packedPrimitive->implementation();
+
+                if (packedImpl) {
+
+                    GU_PackedGeometry* packedGeo = dynamic_cast<GU_PackedGeometry*>(packedImpl);
+                    GU_PackedFragment* packedFragment = dynamic_cast<GU_PackedFragment*>(packedImpl);
+
+                    if (packedGeo)                  packedGeo->forceLoad();
+                    else if (packedFragment)        packedFragment->forceLoad();
+                    else {
+                        // unknown packed implementation
+                        continue;
+                    }
+
+                    long id = packedGeo ? packedGeo->geometryId() : packedFragment->geometryId();
+
+                    if (packedFragment) {
+                        std::string name = packedFragment->name().toStdString();
+                        std::unordered_map<std::string, int>& localFragmentMap = packedFragmentMap[id];
+                        const long localId = localFragmentMap[name];
+                        id = (id << 32) | localId;
+                    }
+
+                    // extract pivot (if not consistent)
+
+                    if (!consistentPivots) {
+                        const UT_Vector3D& pivot = packedPrimitive->pivot();
+                        translateHandle.set(offset, 0, pivot.x());
+                        translateHandle.set(offset, 1, pivot.y());
+                        translateHandle.set(offset, 2, pivot.z());
+                    }
+
+                    // store scale if required
+
+                    UT_Matrix3D localTransform = packedPrimitive->localTransform();
+
+                    if (containsScale) {
+                        UT_Vector3D scale;
+                        UT_Vector3D shear;
+                        localTransform.extractScales(scale, &shear);
+                        scaleHandle.set(offset, 0, scale.x());
+                        scaleHandle.set(offset, 1, scale.y());
+                        scaleHandle.set(offset, 2, scale.z());
+                    }
+
+                    UT_Quaternion quat;
+                    quat.updateFromRotationMatrix(localTransform);
+
+                    rotateHandle.set(offset, 0, quat.x());
+                    rotateHandle.set(offset, 1, quat.y());
+                    rotateHandle.set(offset, 2, quat.z());
+                    rotateHandle.set(offset, 3, quat.w());
+
+                    if (packedFragmentMap.size() > 0) {
+                        idHandle64.set(offset, 0, id);
+                    }
+                    else {
+                        idHandle32.set(offset, 0, static_cast<int>(id));
+                    }
+                }
+            }
+
+            newGeo = &pointsTempGeo;
         }
 
-        UT_String nameStr = "";
-        evalString(nameStr, "name", 0, time);
-        hvdb::createVdbPrimitive(*gdp, pointDataGrid, nameStr.toStdString().c_str());
+        openvdb::points::PointDataGrid::Ptr points = convertPointsToPointDataGrid(newGeo, context);
 
-        mBoss.end();
+        if (points) {
+            UT_String nameStr = "";
+            evalString(nameStr, "name", 0, time);
+            hvdb::createVdbPrimitive(*gdp, points, nameStr.toStdString().c_str());
+        }
 
     } catch (const std::exception& e) {
         addError(SOP_MESSAGE, e.what());
     }
     return error();
 }
+
 
 // Copyright (c) 2012-2017 DreamWorks Animation LLC
 // All rights reserved. This software is distributed under the
