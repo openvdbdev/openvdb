@@ -145,6 +145,11 @@ std::unique_ptr<char[]>
 bloscCompress(const char* buffer, const size_t uncompressedBytes, size_t& compressedBytes,
     const bool resize)
 {
+    if (uncompressedBytes > size_t(std::numeric_limits<int32_t>::max())) {
+        OPENVDB_THROW(RuntimeError,
+            "Blosc compress failed due to exceeding maximum uncompressed buffer size.");
+    }
+
     size_t tempBytes = uncompressedBytes;
     // increase temporary buffer for padding if necessary
     if (tempBytes >= BLOSC_MINIMUM_BYTES && tempBytes < BLOSC_PAD_BYTES) {
@@ -177,6 +182,11 @@ bloscCompress(const char* buffer, const size_t uncompressedBytes, size_t& compre
 size_t
 bloscCompressedSize( const char* buffer, const size_t uncompressedBytes)
 {
+    if (uncompressedBytes > size_t(std::numeric_limits<int32_t>::max())) {
+        OPENVDB_THROW(RuntimeError,
+            "Blosc compress failed due to exceeding maximum uncompressed buffer size.");
+    }
+
     size_t compressedBytes;
     bloscCompress(buffer, uncompressedBytes, compressedBytes, /*resize=*/false);
     return compressedBytes;

@@ -1283,9 +1283,32 @@ PointDataLeafNode<T, Log2Dim>::readBuffers(std::istream& is, const CoordBBox& /*
             uint8_t header;
             is.read(reinterpret_cast<char*>(&header), sizeof(uint8_t));
             mAttributeSet->readDescriptor(is);
-            if (header & uint8_t(1)) {
-                AttributeSet::DescriptorPtr descriptor = mAttributeSet->descriptorPtr();
-                Local::insertDescriptor(meta->auxData(), descriptor);
+
+            AttributeSet::DescriptorPtr descriptor = mAttributeSet->descriptorPtr();
+
+            // pass 1 - descriptor and attribute metadata
+            auto metadata = io::getStreamMetadataPtr(is);
+
+            // check if file version supports VDB topology
+
+            const uint32_t fileVersion = metadata->fileVersion();
+            const bool topologySupported = fileVersion >= OPENVDB_FILE_VERSION_ATTRIBUTE_TOPOLOGY;
+
+            // only read the topology if enabled in the descriptor
+
+            if (topologySupported) {
+                if (header & uint8_t(1)) {
+                    Local::insertDescriptor(meta->auxData(), descriptor);
+                }
+                // read descriptor topology
+                if (header & uint8_t(8)) {
+                    descriptor->readTopology(is);
+                }
+            }
+            else {
+                if (header == uint8_t(1)) {
+                    Local::insertDescriptor(meta->auxData(), descriptor);
+                }
             }
             // a forwards-compatibility mechanism for future use,
             // if a 0x2 bit is set, read and skip over a specific number of bytes
@@ -1486,18 +1509,53 @@ PointDataLeafNode<T, Log2Dim>::writeBuffers(std::ostream& os, bool toHalf) const
     }
     else if (pass == 1) {
         // pass 1 - descriptor and attribute metadata
+        auto metadata = io::getStreamMetadataPtr(os);
+
+        // check if file version supports VDB topology
+
+        const uint32_t fileVersion = metadata->fileVersion();
+        const bool topologySupported = fileVersion >= OPENVDB_FILE_VERSION_ATTRIBUTE_TOPOLOGY;
+
         bool matchingDescriptor = Local::hasMatchingDescriptor(meta->auxData());
         if (matchingDescriptor) {
+
             AttributeSet::Descriptor::Ptr descriptor = Local::retrieveMatchingDescriptor(meta->auxData());
             if (descriptor) {
                 // write a header to indicate a shared descriptor
                 uint8_t header(1);
+
+                // to retain bgeo compatibility, disable writing the topology
+
+                bool topologyTempDisabled(false);
+
+                if (descriptor->isTopologyEnabled()) {
+                    if (topologySupported && !descriptor->topology().empty()) {
+                        // if topology is supported and the grid has topology, then mark the header
+                        header |= uint8_t(8);
+                    }
+                    else {
+                        // if topology is enabled, but not supported, then temporarily disable it
+                        topologyTempDisabled = true;
+                        mAttributeSet->descriptor().disableTopology();
+                    }
+                }
+
                 os.write(reinterpret_cast<const char*>(&header), sizeof(uint8_t));
                 mAttributeSet->writeDescriptor(os, /*transient=*/false);
+
+                if (topologyTempDisabled) {
+                    // now re-enable topology if it was previously enabled
+                    mAttributeSet->descriptor().enableTopology();
+                }
+
+                if (header & uint8_t(8)) {
+                    descriptor->writeTopology(os);
+                }
             }
         }
         else {
             // write a header to indicate a non-shared descriptor
+            // don't write topology if descriptor is not shared
             uint8_t header(0);
             os.write(reinterpret_cast<const char*>(&header), sizeof(uint8_t));
             mAttributeSet->writeDescriptor(os, /*transient=*/false);
