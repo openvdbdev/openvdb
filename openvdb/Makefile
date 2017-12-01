@@ -348,6 +348,7 @@ INCLUDE_NAMES := \
     points/AttributeArrayString.h \
     points/AttributeGroup.h \
     points/AttributeSet.h \
+    points/AttributeTopology.h \
     points/IndexFilter.h \
     points/IndexIterator.h \
     points/PointAttribute.h \
@@ -451,6 +452,7 @@ SRC_NAMES := \
     points/AttributeArrayString.cc \
     points/AttributeGroup.cc \
     points/AttributeSet.cc \
+    points/AttributeTopology.cc \
     points/points.cc \
     points/StreamCompression.cc \
     util/Formats.cc \
@@ -467,6 +469,7 @@ UNITTEST_SRC_NAMES := \
     unittest/TestAttributeArrayString.cc \
     unittest/TestAttributeSet.cc \
     unittest/TestAttributeGroup.cc \
+    unittest/TestAttributeTopology.cc \
     unittest/TestBBox.cc \
     unittest/TestConjGradient.cc \
     unittest/TestCoord.cc \

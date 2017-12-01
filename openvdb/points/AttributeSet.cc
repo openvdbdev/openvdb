@@ -528,6 +528,7 @@ AttributeSet::Descriptor::Descriptor(const Descriptor& rhs)
     , mTypes(rhs.mTypes)
     , mGroupMap(rhs.mGroupMap)
     , mMetadata(rhs.mMetadata)
+    , mTopology(rhs.isTopologyEnabled() ? rhs.mTopology : AttributeTopology())
 {
 }
 
@@ -548,6 +549,8 @@ AttributeSet::Descriptor::operator==(const Descriptor& rhs) const
     }
 
     if (this->mMetadata != rhs.mMetadata)  return false;
+
+    // TODO: compare topology
 
     return  std::equal(mGroupMap.begin(), mGroupMap.end(), rhs.mGroupMap.begin()) &&
             std::equal(mNameMap.begin(), mNameMap.end(), rhs.mNameMap.begin());
@@ -688,6 +691,20 @@ AttributeSet::Descriptor::type(size_t pos) const
 }
 
 
+AttributeTopology&
+AttributeSet::Descriptor::topology()
+{
+    return mTopology;
+}
+
+
+const AttributeTopology&
+AttributeSet::Descriptor::topology() const
+{
+    return mTopology;
+}
+
+
 MetaMap&
 AttributeSet::Descriptor::getMetadata()
 {
@@ -803,7 +820,8 @@ AttributeSet::Descriptor::insert(const std::string& name, const NamePair& typeNa
 AttributeSet::Descriptor::Ptr
 AttributeSet::Descriptor::create(const NameAndTypeVec& attrs,
                                  const NameToPosMap& groupMap,
-                                 const MetaMap& metadata)
+                                 const MetaMap& metadata,
+                                 const AttributeTopology& topology)
 {
     auto newDescriptor = std::make_shared<Descriptor>();
 
@@ -813,8 +831,18 @@ AttributeSet::Descriptor::create(const NameAndTypeVec& attrs,
 
     newDescriptor->mGroupMap = groupMap;
     newDescriptor->mMetadata = metadata;
+    newDescriptor->mTopology = topology;
 
     return newDescriptor;
+}
+
+AttributeSet::Descriptor::Ptr
+AttributeSet::Descriptor::create(const NameAndTypeVec& attrs,
+                                 const NameToPosMap& groupMap,
+                                 const MetaMap& metadata)
+{
+    AttributeTopology topology;
+    return Descriptor::create(attrs, groupMap, metadata, topology);
 }
 
 AttributeSet::Descriptor::Ptr
@@ -833,7 +861,8 @@ AttributeSet::Descriptor::duplicateAppend(const Name& name, const NamePair& type
     this->appendTo(attributes.vec);
     attributes.add(NameAndType(name, type, stride));
 
-    return Descriptor::create(attributes.vec, mGroupMap, mMetadata);
+    return Descriptor::create(attributes.vec, mGroupMap, mMetadata,
+        isTopologyEnabled() ? mTopology : AttributeTopology());
 }
 
 AttributeSet::Descriptor::Ptr
@@ -895,7 +924,8 @@ AttributeSet::Descriptor::duplicateDrop(const std::vector<size_t>& pos) const
                 }
             }
 
-            descriptor = Descriptor::create(vec, droppedGroupMap, mMetadata);
+            descriptor = Descriptor::create(vec, droppedGroupMap, mMetadata,
+                isTopologyEnabled() ? mTopology : AttributeTopology());
 
             // remove any unused default values
 
@@ -911,7 +941,8 @@ AttributeSet::Descriptor::duplicateDrop(const std::vector<size_t>& pos) const
         eraseIndices(vec, pos);
     }
 
-    descriptor = Descriptor::create(vec, mGroupMap, mMetadata);
+    descriptor = Descriptor::create(vec, mGroupMap, mMetadata,
+        isTopologyEnabled() ? mTopology : AttributeTopology());
 
     // remove any unused default values
 
@@ -1120,6 +1151,31 @@ AttributeSet::Descriptor::parseNames(   std::vector<std::string>& includeNames,
     Descriptor::parseNames(includeNames, excludeNames, includeAll, nameStr);
 }
 
+
+void
+AttributeSet::Descriptor::enableTopology()
+{
+    MetaMap& meta = this->getMetadata();
+    meta.insertMeta("__topology", BoolMetadata());
+}
+
+
+void
+AttributeSet::Descriptor::disableTopology()
+{
+    MetaMap& meta = this->getMetadata();
+    meta.removeMeta("__topology");
+}
+
+
+bool
+AttributeSet::Descriptor::isTopologyEnabled() const
+{
+    const MetaMap& meta = this->getMetadata();
+    return bool(meta["__topology"]);
+}
+
+
 void
 AttributeSet::Descriptor::write(std::ostream& os) const
 {
@@ -1182,6 +1238,24 @@ AttributeSet::Descriptor::read(std::istream& is)
     }
 
     mMetadata.readMeta(is);
+
+    this->disableTopology();
+}
+
+
+void
+AttributeSet::Descriptor::writeTopology(std::ostream& os) const
+{
+    mTopology.write(os);
+}
+
+
+void
+AttributeSet::Descriptor::readTopology(std::istream& is)
+{
+    mTopology.read(is);
+
+    this->enableTopology();
 }
 
 

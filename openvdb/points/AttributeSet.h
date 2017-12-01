@@ -38,6 +38,7 @@
 #define OPENVDB_POINTS_ATTRIBUTE_SET_HAS_BEEN_INCLUDED
 
 #include "AttributeArray.h"
+#include "AttributeTopology.h"
 #include <openvdb/version.h>
 #include <openvdb/MetaMap.h>
 
@@ -352,6 +353,17 @@ public:
     /// Return the name of the attribute array's type.
     const NamePair& type(size_t pos) const;
 
+    /// Mark a Descriptor as containing valid Topology
+    void enableTopology();
+    /// Mark a Descriptor as not containing valid Topology
+    void disableTopology();
+    /// Return try if a Descriptor contains valid Topology
+    bool isTopologyEnabled() const;
+
+    /// Return the stored attribute topology
+    AttributeTopology& topology();
+    const AttributeTopology& topology() const;
+
     /// Retrieve metadata map
     MetaMap& getMetadata();
     const MetaMap& getMetadata() const;
@@ -454,6 +466,9 @@ public:
     /// Unserialize this transform from the given stream.
     void read(std::istream&);
 
+    void writeTopology(std::ostream&) const;
+    void readTopology(std::istream&);
+
 protected:
     /// Append to a vector of names and types from this Descriptor in position order
     void appendTo(NameAndTypeVec& attrs) const;
@@ -461,6 +476,11 @@ protected:
     /// Create a new descriptor from the given attribute and type name pairs
     /// and copy the group maps and metamap.
     static Ptr create(const NameAndTypeVec&, const NameToPosMap&, const MetaMap&);
+
+    /// Create a new descriptor from the given attribute and type name pairs
+    /// and copy the group maps and metamap.
+    static Ptr create(const NameAndTypeVec&, const NameToPosMap&,
+                      const MetaMap&, const AttributeTopology&);
 
     size_t insert(const std::string& name, const NamePair& typeName);
 
@@ -475,10 +495,11 @@ private:
     // as this change is part of an ABI change, there's no good reason to reduce the reserved
     // space aside from keeping the memory size of an AttributeSet the same for convenience
     // (note that this assumes a typical three-pointer implementation for std::vector)
-    future::Container           mFutureContainer;   // occupies 3 reserved slots
+    AttributeTopology                   mTopology;          // occupies 3 reserved slots
     int64_t                     mReserved[5];       // for future use
 #else
-    int64_t                     mReserved[8];       // for future use
+    AttributeTopology                   mTopology;          // occupies 3 reserved slots
+    int64_t                             mReserved[4];       // for future use
 #endif
 }; // class Descriptor
 
